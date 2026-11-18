@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: winupdate
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    autoDeploy: false
+    envVars:
+      - key: RAF_TOKEN
+        value: raf2026
+      - key: RAF_SECRET
+        sync: false
