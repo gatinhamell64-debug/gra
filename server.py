@@ -233,7 +233,7 @@ class HttpSession:
         self.rid = 0
         self.last_seen = time.time()
 
-    def check(self, stale=150):
+    def check(self, stale=45):
         if self.alive and time.time() - self.last_seen > stale:
             self.alive = False
         return self.alive
